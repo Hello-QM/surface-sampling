@@ -157,26 +157,28 @@ python scripts/create_surface_formation_entries.py --surface_name "LaMnO3_001_2x
   year = {2023},
   month = dec,
   journal = {Nature Computational Science},
-  pages = {1--11},
-  publisher = {Nature Publishing Group},
+  pages = {1034--1044},
   issn = {2662-8457},
   doi = {10.1038/s43588-023-00571-7},
-  urldate = {2023-12-07},
-  keywords = {Computational methods,Computational science,Software,Surface chemistry}
+  urldate = {2023-12-07}
 }
+
 ```
 
 2. VSSR-MC with aqueous electrochemical conditions:
 ```bib
-@misc{duAcceleratingEnhancingThermodynamic2025,
+@article{duAcceleratingEnhancingThermodynamic2025,
   title = {Accelerating and Enhancing Thermodynamic Simulations of Electrochemical Interfaces},
   author = {Du, Xiaochen and Liu, Mengren and Peng, Jiayu and Chun, Hoje and Hoffman, Alexander and Yildiz, Bilge and Li, Lin and Bazant, Martin Z. and {G{\'o}mez-Bombarelli}, Rafael},
   year = {2025},
-  month = mar,
-  number = {arXiv:2503.17870},
-  publisher = {arXiv},
-  doi = {10.48550/arXiv.2503.17870},
-  keywords = {Computer Science - Computational Engineering Finance and Science,Computer Science - Machine Learning,Condensed Matter - Materials Science,Condensed Matter - Statistical Mechanics},
+  month = sep,
+  journal = {ACS Central Science},
+  volume = {11},
+  number = {9},
+  pages = {1558--1572},
+  issn = {2374-7943, 2374-7951},
+  doi = {10.1021/acscentsci.5c00547},
+  urldate = {2025-10-02},
 }
 ```
 
