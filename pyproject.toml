@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools >= 50.0"]
+requires = ["setuptools >= 50.0", "torch>=2.1.0,<2.6.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -24,6 +24,7 @@ dependencies = [
     "mpcontribs-client",
     "ipykernel",
     "ipywidgets",
+    "uv",
 ]
 classifiers = [
     "Intended Audience :: Science/Research",
@@ -44,6 +45,9 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/learning-matter-mit/surface-sampling/"
+
+[tool.uv.extra-build-dependencies]
+torch-scatter = ["torch"]
 
 [tool.setuptools]
 packages.find = { where = ["."], include = ["mcmc*"] }
