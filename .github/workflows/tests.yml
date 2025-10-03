@@ -12,29 +12,33 @@ jobs:
       max-parallel: 5
 
     steps:
-    # Checkout repository
+    # 1. Checkout repository
     - name: Checkout source
       uses: actions/checkout@v4
 
-    # Setup micromamba and Python environment
+    # 2. Set up micromamba environment
     - name: Setup micromamba with test environment
       uses: mamba-org/setup-micromamba@v1
       with:
-        environment-file: environment.yml    # Make sure uv is included in this file OR:
+        environment-file: environment.yml
         environment-name: test-env
-        create-args: >-
-          uv
-          torch>=2.1.0,<2.6.0
+        create-args: ""
         init-shell: bash
         generate-run-shell: true
 
-    # Install Python dependencies using uv
+    # 3. Install PyTorch using pip
+    - name: Install PyTorch with pip
+      shell: micromamba-shell bash
+      run: |
+        pip install "torch<2.6.0,>=2.1.0"
+
+    # 4. Install local and dev dependencies using uv
     - name: Install Python dependencies with uv
       shell: micromamba-shell bash
       run: |
         uv pip install -e '.[dev]'
 
-    # Set up environment variables for LAMMPS
+    # 5. Set up environment variables for LAMMPS
     - name: Configure LAMMPS paths
       shell: micromamba-shell bash
       run: |
@@ -42,7 +46,7 @@ jobs:
         echo "LAMMPS_COMMAND=$(which lmp)" >> $GITHUB_ENV
         echo "ASE_LAMMPSRUN_COMMAND=$(which lmp)" >> $GITHUB_ENV
 
-    # Display configured LAMMPS paths (for debugging)
+    # 6. Display environment variables for debugging
     - name: Print LAMMPS paths
       shell: micromamba-shell bash
       run: |
@@ -50,7 +54,7 @@ jobs:
         echo "LAMMPS_COMMAND = $LAMMPS_COMMAND"
         echo "ASE_LAMMPSRUN_COMMAND = $ASE_LAMMPSRUN_COMMAND"
 
-    # Run tests
+    # 7. Run test suite
     - name: Run tests with pytest
       shell: micromamba-shell bash
       run: |
