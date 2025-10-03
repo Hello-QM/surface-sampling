@@ -1,8 +1,11 @@
-name:
-  - vssr-mc
+name: vssr-mc
 channels:
   - conda-forge
 dependencies:
+  - python=3.11
   - lammps
   - kimpy
   - openkim-models
+  - pip
+  - pip:
+      - uv
