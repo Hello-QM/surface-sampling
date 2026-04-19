@@ -7,136 +7,324 @@ from collections import Counter
 
 import ase
 import numpy as np
+from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator, all_changes
 from ase.formula import Formula
-from lammps import (
-    LMP_STYLE_ATOM,
-    LMP_STYLE_GLOBAL,
-    LMP_TYPE_SCALAR,
-    LMP_TYPE_VECTOR,
-    lammps,
-)
-from nff.io.ase import AtomsBatch
-from nff.io.ase_calcs import EnsembleNFF, NeuralFF
-from nff.utils.constants import HARTREE_TO_EV
-from tqdm import tqdm
+try:
+    from lammps import (
+        LMP_STYLE_ATOM,
+        LMP_STYLE_GLOBAL,
+        LMP_TYPE_SCALAR,
+        LMP_TYPE_VECTOR,
+        lammps,
+    )
+except ImportError:
+    LMP_STYLE_ATOM = LMP_STYLE_GLOBAL = LMP_TYPE_SCALAR = LMP_TYPE_VECTOR = None
+    lammps = None
 
-from mcmc.pourbaix.atoms import PourbaixAtom
+from mace.calculators import MACECalculator
 
-from .lammpsrun import LAMMPS as LAMMPSRun
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs):
+        return x
+
+try:
+    from mcmc.pourbaix.atoms import PourbaixAtom
+except ImportError:
+    PourbaixAtom = None
+
+try:
+    from .lammpsrun import LAMMPS as LAMMPSRun
+except ImportError:
+    LAMMPSRun = None
 
 logger = logging.getLogger(__name__)
 
 ENERGY_THRESHOLD = 1000  # eV
 MAX_FORCE_THRESHOLD = 1000  # eV/Angstrom
+HARTREE_TO_EV = 27.211386245988
 
 
-def get_results_single(atoms_batch: AtomsBatch, calc: Calculator) -> dict:
-    """Calculate the results for a single AtomsBatch object.
+def get_results_single(atoms: Atoms, calc: Calculator) -> dict:
+    """Calculate the results for a single Atoms object.
 
     Args:
-        atoms_batch (AtomsBatch): The AtomsBatch object to calculate the results for.
+        atoms (Atoms): The Atoms object to calculate the results for.
         calc (Calculator): The calculator to use.
 
     Returns:
         dict: The results of the calculation
     """
-    atoms_batch.calc = calc
-    calc.calculate(atoms_batch)
+    atoms.calc = calc
+    calc.calculate(atoms)
 
     return calc.results
 
 
-def get_embeddings(atoms_batches: list[AtomsBatch], calc: Calculator) -> np.ndarray:
-    """Calculate the embeddings for a list of AtomsBatch objects
+def get_embeddings(atoms_list: list[Atoms], calc: Calculator) -> np.ndarray:
+    """Calculate the embeddings for a list of Atoms objects
 
     Args:
-        atoms_batches (list[AtomsBatch]): List of AtomsBatch objects.
-        calc (Calculator): NFF Calculator.
+        atoms_list (list[Atoms]): List of Atoms objects.
+        calc (Calculator): MACE Calculator.
 
     Returns:
         np.ndarray: Latent space embeddings with each row corresponding to a structure
     """
-    print(f"Calculating embeddings for {len(atoms_batches)} structures")
+    print(f"Calculating embeddings for {len(atoms_list)} structures")
     embeddings = []
-    for atoms_batch in tqdm(atoms_batches):
-        embedding = get_embeddings_single(atoms_batch, calc)
+    for atoms in tqdm(atoms_list):
+        embedding = get_embeddings_single(atoms, calc)
         embeddings.append(embedding)
     return np.stack(embeddings)
 
 
 def get_embeddings_single(
-    atoms_batch: AtomsBatch,
+    atoms: Atoms,
     calc: Calculator,
     results_cache: dict | None = None,
     flatten: bool = True,
     flatten_axis: int = 0,
 ) -> np.ndarray:
-    """Calculate the embeddings for a single AtomsBatch object
+    """Calculate the embeddings for a single Atoms object using MACE forward hooks.
 
     Args:
-        atoms_batch (AtomsBatch): AtomsBatch object.
-        calc (Calculator): NFF Calculator.
-        results_cache (dict): Cache for results.
+        atoms (Atoms): Atoms object.
+        calc (Calculator): MACE Calculator (MACESurface or MACECalculator).
+        results_cache (dict): Cache for results (unused, kept for API compatibility).
         flatten (bool): Whether to flatten the embeddings.
         flatten_axis (int): Axis to flatten the embeddings.
 
     Returns:
         np.ndarray: Latent space embeddings
     """
-    if results_cache is not None and "embedding" in results_cache:
-        results = results_cache
+    import torch
+
+    # Get the underlying MACE model
+    if hasattr(calc, "calculators"):
+        mace_calc = calc.calculators[0]
+    elif hasattr(calc, "mace_calc"):
+        mace_calc = calc.mace_calc
     else:
-        results = get_results_single(atoms_batch, calc)
-    return (
-        results["embedding"].mean(axis=flatten_axis).squeeze()
-        if flatten
-        else results["embedding"].squeeze()
-    )
+        mace_calc = calc
+
+    model = mace_calc.models[0]
+    embeddings = []
+
+    def hook_fn(mod, inp, out):
+        if isinstance(out, tuple):
+            embeddings.append(out[0].detach().cpu())
+        else:
+            embeddings.append(out.detach().cpu())
+
+    hook = model.products[-1].register_forward_hook(hook_fn)
+    try:
+        mace_calc.calculate(atoms)
+    finally:
+        hook.remove()
+
+    if embeddings:
+        emb = embeddings[0]  # (num_atoms, embedding_dim)
+        emb_np = emb.numpy()
+        if flatten:
+            return emb_np.mean(axis=flatten_axis).squeeze()
+        return emb_np.squeeze()
+
+    # Fallback: return zeros if hook didn't fire
+    mace_calc.calculate(atoms)
+    return np.zeros(128)
 
 
-def get_std_devs(atoms_batches: list[AtomsBatch], calc: Calculator) -> np.ndarray:
-    """Calculate the force standard deviations across multiple models for a list of AtomsBatch
-        objects
+def get_std_devs(atoms_list: list[Atoms], calc: Calculator) -> np.ndarray:
+    """Calculate the force standard deviations across multiple models for a list of Atoms objects
 
     Args:
-    atoms_batches (List[AtomsBatch]): List of AtomsBatch objects
-    calc (Calculator): NFF Calculator
+        atoms_list (List[Atoms]): List of Atoms objects
+        calc (Calculator): MACE Calculator
 
     Returns:
         np.ndarray: Force standard deviation with a single value for each structure
     """
-    print(f"Calculating force standard deviations for {len(atoms_batches)} structures")
+    print(f"Calculating force standard deviations for {len(atoms_list)} structures")
     force_stds = []
-    for atoms_batch in tqdm(atoms_batches):
-        force_std = get_std_devs_single(atoms_batch, calc)
+    for atoms in tqdm(atoms_list):
+        force_std = get_std_devs_single(atoms, calc)
         force_stds.append(force_std)
 
     return np.stack(force_stds)
 
 
-def get_std_devs_single(atoms_batch: AtomsBatch, calc: Calculator) -> np.ndarray:
-    """Calculate the force standard deviation for a single AtomsBatch object
+def get_std_devs_single(atoms: Atoms, calc: Calculator) -> float:
+    """Calculate the force standard deviation for a single Atoms object
 
     Args:
-        atoms_batch (AtomsBatch): AtomsBatch object
-        calc (Calculator): NFF Calculator
+        atoms (Atoms): Atoms object
+        calc (Calculator): MACE Calculator (MACESurface with ensemble)
 
     Returns:
-        np.ndarray: Force standard deviation
+        float: Force standard deviation
     """
-    if len(calc.models) > 1:
-        atoms_batch.calc = calc
-        calc.calculate(atoms_batch)
-        force_std = calc.results.get("forces_std", np.array([0.0])).mean()
-    else:
-        force_std = 0.0
+    if hasattr(calc, "calculators") and len(calc.calculators) > 1:
+        forces_list = []
+        for c in calc.calculators:
+            c.calculate(atoms)
+            forces_list.append(c.results["forces"].copy())
+        return np.std(forces_list, axis=0).mean()
+    return 0.0
 
-    return force_std
+
+class MACESurface(Calculator):
+    """MACE-based surface energy calculator with optional ensemble."""
+
+    implemented_properties = ("energy", "forces", "stress", "surface_energy")
+
+    def __init__(self, model_paths, device="cuda", enable_cueq=True, **kwargs):
+        """Initialize the MACESurface class.
+
+        Args:
+            model_paths: List of paths to MACE model files.
+            device: Device to use ('cuda' or 'cpu').
+            enable_cueq: Whether to enable cuEquivariance.
+            **kwargs: Additional keyword arguments.
+        """
+        super().__init__(**kwargs)
+        if isinstance(model_paths, str):
+            model_paths = [model_paths]
+        self.calculators = [
+            MACECalculator(model_paths=p, device=device, enable_cueq=enable_cueq)
+            for p in model_paths
+        ]
+        self.chem_pots = {}
+        self.offset_data = {}
+        self.offset_units = kwargs.get("offset_units", "eV")
+        self.logger = kwargs.get("logger", logging.getLogger(__name__))
+
+    def get_surface_energy(
+        self,
+        atoms: ase.Atoms = None,
+        chem_pots: dict | None = None,
+        offset_data: dict | None = None,
+    ) -> float:
+        """Get the surface energy of the system by subtracting the bulk energy and the chemical
+        potential deviation from the bulk formula. Refer to Methods-Surface stability analysis
+        section of Du, X. et al. Nat Comput Sci 1-11 (2023) doi:10.1038/s43588-023-00571-7
+        for details.
+
+        Args:
+            atoms (ase.Atoms): The atoms object to calculate the surface energy for.
+            chem_pots (dict): The chemical potentials of the atoms in the system.
+            offset_data (dict): The offset data for the system.
+
+        Returns:
+            float: The surface energy of the system.
+        """
+        if atoms is None:
+            atoms = self.atoms
+
+        if chem_pots is None:
+            chem_pots = self.chem_pots
+
+        if offset_data is None:
+            offset_data = self.offset_data
+        if not offset_data:
+            self.logger.debug("No offset_data, using raw potential energy as surface energy")
+            return self.get_potential_energy(atoms=atoms)
+
+        # Starting with the potential energy of the system (akin to DFT energy of the slab)
+        surface_energy = self.get_potential_energy(atoms=atoms)
+
+        ads_count = Counter(atoms.get_chemical_symbols())
+
+        bulk_energies = offset_data["bulk_energies"]
+        stoics = offset_data["stoics"]
+        ref_formula = offset_data["ref_formula"]
+        ref_element = offset_data["ref_element"]
+
+        # Subtract the bulk energies
+        bulk_ref_en = ads_count[ref_element] * bulk_energies[ref_formula]
+        for ele in ads_count:
+            if ele != ref_element:
+                bulk_ref_en += (
+                    ads_count[ele] - stoics.get(ele, 0) / stoics[ref_element] * ads_count[ref_element]
+                ) * bulk_energies[ele]
+
+        if self.offset_units == "atomic":
+            surface_energy -= bulk_ref_en * HARTREE_TO_EV
+        else:
+            surface_energy -= bulk_ref_en
+
+        # Subtract chemical potential deviation from bulk formula
+        stoics = self.offset_data["stoics"]
+        ref_element = self.offset_data["ref_element"]
+
+        pot = 0
+        for ele in ads_count:
+            if ele != ref_element:
+                pot += (
+                    ads_count[ele] - stoics.get(ele, 0) / stoics[ref_element] * ads_count[ref_element]
+                ) * self.chem_pots[ele]
+
+        surface_energy -= pot
+        return surface_energy
+
+    def set(self, **kwargs) -> dict:
+        """Set parameters in key-value pairs. A dictionary containing the parameters that have been
+        changed is returned. The special keyword 'parameters' can be used to read parameters from a
+        file.
+
+        Args:
+            **kwargs: The parameters to set.
+
+        Returns:
+            dict: A dictionary containing the parameters that have been changed.
+        """
+        changed_parameters = Calculator.set(self, **kwargs)
+        if "chem_pots" in self.parameters:
+            self.chem_pots = self.parameters["chem_pots"]
+            self.logger.info("chemical potentials: %s are set from parameters", self.chem_pots)
+        if "offset_data" in self.parameters:
+            self.offset_data = self.parameters["offset_data"]
+            self.logger.info("offset data: %s is set from parameters", self.offset_data)
+        return changed_parameters
+
+    def calculate(
+        self,
+        atoms: ase.Atoms = None,
+        properties: tuple = ("energy", "forces"),
+        system_changes: list = all_changes,
+    ):
+        """Calculate using MACE ensemble before adding surface energy calcs to results.
+
+        Args:
+            atoms (ase.Atoms): The atoms object to calculate the properties for.
+            properties (tuple): The properties to calculate.
+            system_changes (list): The system changes to calculate.
+        """
+        if atoms is None:
+            atoms = self.atoms
+
+        Calculator.calculate(self, atoms, properties, system_changes)
+
+        # Use first calculator for primary results
+        self.calculators[0].calculate(atoms)
+        self.results.update(self.calculators[0].results)
+
+        # Ensemble: compute forces_std from all models
+        if len(self.calculators) > 1:
+            all_forces = [self.calculators[0].results["forces"].copy()]
+            for calc in self.calculators[1:]:
+                calc.calculate(atoms)
+                all_forces.append(calc.results["forces"].copy())
+            self.results["forces_std"] = np.std(all_forces, axis=0).mean()
+
+        if "surface_energy" in properties:
+            self.results["surface_energy"] = self.get_surface_energy(atoms=atoms)
 
 
-class NFFPourbaix(NeuralFF):
-    """Calculate Pourbaix potential for surface or bulk systems using Neural Force Field.
+class MACEPourbaix(Calculator):
+    """Calculate Pourbaix potential for surface or bulk systems using MACE.
     We calculate the energy difference based on consecutive desorption/adsorption reactions as in
     Rong and Kolpak, J. Phys. Chem. Lett., 2015.
     Each step consists of the following:
@@ -173,24 +361,44 @@ class NFFPourbaix(NeuralFF):
             Pourbaix potential.
         get_pourbaix_potential: Get the Pourbaix potential of the system.
         set: Set parameters.
-        calculate: Calculate based on NeuralFF before adding surface energy calculations to results.
+        calculate: Calculate based on MACE before adding surface energy calculations to results.
     """
 
     implemented_properties = (
-        *NeuralFF.implemented_properties,
+        "energy",
+        "forces",
+        "stress",
         "pourbaix_potential",
         "surface_energy",
     )
 
-    def __init__(self, *args, **kwargs):
-        """Initialize the NFFPourbaix class."""
-        super().__init__(*args, **kwargs)
+    def __init__(self, model_path, device="cuda", enable_cueq=True, **kwargs):
+        """Initialize the MACEPourbaix class.
+
+        Args:
+            model_path: Path to MACE model file (str) or list with single path.
+            device: Device to use.
+            enable_cueq: Whether to enable cuEquivariance.
+            **kwargs: Additional keyword arguments including:
+                offset_data (dict): MACE-consistent bulk reference energies for
+                    surface energy computation. Keys: bulk_energies, stoics,
+                    ref_formula, ref_element. When provided, get_delta_G1 uses
+                    MACE bulk energies instead of MP atom_std_state_energy,
+                    ensuring slab and reference are on the same energy scale.
+        """
+        super().__init__(**kwargs)
+        if isinstance(model_path, list):
+            model_path = model_path[0]
+        self.mace_calc = MACECalculator(
+            model_paths=model_path, device=device, enable_cueq=enable_cueq
+        )
         self.chem_pots = {}
         self.reference_slab = {}
         self.temp = kwargs.get("temp", 0.0257)  # temperature in eV
         self.phi = kwargs.get("phi", 0)  # electric potential
         self.pH = kwargs.get("pH", 7)  # pH
         self.pourbaix_atoms = {}
+        self.offset_data = kwargs.get("offset_data", {})
         self.adsorbate_corrections = {}
         self.logger = kwargs.get("logger", logging.getLogger(__name__))
 
@@ -233,7 +441,29 @@ class NFFPourbaix(NeuralFF):
         return delta_G2
 
     def get_delta_G1(self, atoms: ase.Atoms = None) -> float:
-        """Get the dissociation energy of all atoms
+        """Get the dissociation energy of all atoms.
+
+        When offset_data is provided, uses MACE-consistent bulk reference energies
+        (same energy scale as the MACE slab energy) instead of Materials Project
+        atom_std_state_energy values. This eliminates the energy reference mismatch
+        between MACE slab energies and MP/DFT chemical potentials.
+
+        The surface energy convention with offset_data:
+            delta_G1 = E_slab - E_bulk_ref
+        where E_bulk_ref is computed from MACE bulk energies using the same
+        stoichiometric subtraction as MACESurface.get_surface_energy().
+
+        If ``oxide_correction_per_O`` is present in offset_data, the
+        MP2020Compatibility oxide anion correction is applied to bring
+        MACE energies (trained on uncorrected PBE) onto the same scale
+        as the MP Pourbaix ion data used in delta_G2. The correction is
+        added to both the slab energy and the bulk reference energies
+        (already baked into the corrected bulk_energies). See
+        ``apply_compatibility.py`` for derivation.
+
+        Without offset_data (backward compatible):
+            delta_G1 = sum(mu_std) - E_slab
+
         Args:
             atoms (ase.Atoms, optional): The atoms object to calculate the dissociation energy for.
                 Defaults to None.
@@ -244,13 +474,48 @@ class NFFPourbaix(NeuralFF):
         if atoms is None:
             atoms = self.atoms
 
-        atoms_count = Counter(atoms.get_chemical_symbols())
-        sum_chem_pots = 0
-        for atom, count in atoms_count.items():
-            sum_chem_pots += count * self.pourbaix_atoms[atom].atom_std_state_energy
         slab_energy = self.get_potential_energy(atoms=atoms)
-        # Add adsorbate corrections, e.g. OH ZPE-TS correction
 
+        if self.offset_data:
+            # Use MACE-consistent bulk references (same energy scale as slab)
+            ads_count = Counter(atoms.get_chemical_symbols())
+            bulk_energies = self.offset_data["bulk_energies"]
+            stoics = self.offset_data["stoics"]
+            ref_formula = self.offset_data["ref_formula"]
+            ref_element = self.offset_data["ref_element"]
+
+            # Apply MP2020 oxide anion correction to slab energy if available.
+            # MACE predicts on the uncorrected DFT scale; the Pourbaix ion data
+            # (delta_G2_std) is calibrated against MP-corrected DFT. Adding the
+            # oxide correction here brings delta_G1 onto the same scale.
+            # The bulk_energies in offset_data should already include the
+            # correction for compounds (IrO2, H2O) but not for elemental refs.
+            oxide_corr = self.offset_data.get("oxide_correction_per_O", 0.0)
+            if oxide_corr != 0.0:
+                n_O_slab = ads_count.get("O", 0)
+                slab_energy += oxide_corr * n_O_slab
+
+            bulk_ref_en = ads_count[ref_element] * bulk_energies[ref_formula]
+            for ele in ads_count:
+                if ele != ref_element:
+                    bulk_ref_en += (
+                        ads_count[ele] - stoics.get(ele, 0) / stoics[ref_element] * ads_count[ref_element]
+                    ) * bulk_energies[ele]
+
+            # Surface energy convention: no negative sign
+            delta_G1 = slab_energy - bulk_ref_en
+        else:
+            # Original: uses atom_std_state_energy from PhaseDiagram (MP DFT)
+            atoms_count = Counter(atoms.get_chemical_symbols())
+            sum_chem_pots = 0
+            for atom, count in atoms_count.items():
+                sum_chem_pots += count * self.pourbaix_atoms[atom].atom_std_state_energy
+            delta_G1 = sum_chem_pots - slab_energy
+
+        # Add adsorbate corrections, e.g. OH ZPE-TS correction
+        # Note: corrections are only applied if the adsorbate species is actually
+        # present in the slab formula. If not, divmod returns 0 and no correction
+        # is added.
         formula = Formula(atoms.get_chemical_formula())
         for adsorbate, correction in self.adsorbate_corrections.items():
             # Check for H2O
@@ -268,8 +533,8 @@ class NFFPourbaix(NeuralFF):
                     formula = Formula.from_dict(formula_dict)
                     logger.info("Corrected formula %s", formula)
             div, _ = divmod(formula, adsorbate)
-            slab_energy += div * correction
-        return sum_chem_pots - slab_energy
+            delta_G1 += div * correction
+        return delta_G1
 
     def get_surface_energy(self, atoms: ase.Atoms = None) -> float:
         """Get the surface energy of the system, which is equivalent to the Pourbaix potential.
@@ -315,7 +580,7 @@ class NFFPourbaix(NeuralFF):
         Returns:
             dict: A dictionary containing the parameters that have been changed.
         """
-        changed_params = NeuralFF.set(self, **kwargs)
+        changed_params = Calculator.set(self, **kwargs)
         if "temperature" in self.parameters:
             self.temp = self.parameters["temperature"]
             self.logger.info("temperature: %.3f in kBT", self.temp)
@@ -328,6 +593,9 @@ class NFFPourbaix(NeuralFF):
         if "pourbaix_atoms" in self.parameters:
             self.pourbaix_atoms = self.parameters["pourbaix_atoms"]
             self.logger.info("Pourbaix atoms: %s are set from parameters", self.pourbaix_atoms)
+        if "offset_data" in self.parameters:
+            self.offset_data = self.parameters["offset_data"]
+            self.logger.info("offset data: %s is set from parameters", self.offset_data)
         if "adsorbate_corrections" in self.parameters:
             self.adsorbate_corrections = self.parameters["adsorbate_corrections"]
             self.logger.info(
@@ -338,10 +606,10 @@ class NFFPourbaix(NeuralFF):
     def calculate(
         self,
         atoms: ase.Atoms = None,
-        properties: tuple = implemented_properties,
+        properties: tuple = ("energy", "forces"),
         system_changes: list = all_changes,
     ):
-        """Caculate based on NeuralFF before add in surface energy calcs to results
+        """Calculate based on MACE before adding surface energy calcs to results.
         Args:
             atoms: ase.Atoms
                 The atoms object to calculate the properties for.
@@ -353,140 +621,18 @@ class NFFPourbaix(NeuralFF):
         if atoms is None:
             atoms = self.atoms
 
-        NeuralFF.calculate(self, atoms, properties, system_changes)
+        Calculator.calculate(self, atoms, properties, system_changes)
+
+        self.mace_calc.calculate(atoms)
+        self.results.update(self.mace_calc.results)
 
         if "surface_energy" in properties:
             self.results["surface_energy"] = self.get_pourbaix_potential(atoms=atoms)
 
-        atoms.results.update(self.results)
 
-
-# TODO define abstract base class for surface energy calcs
-# use EnsembleNFF, NeuralFF classes for NFF
-class EnsembleNFFSurface(EnsembleNFF):
-    """Based on Ensemble Neural Force Field class to calculate surface energy"""
-
-    implemented_properties = (*EnsembleNFF.implemented_properties, "surface_energy")
-
-    def __init__(self, *args, **kwargs):
-        """Initialize the EnsembleNFFSurface class."""
-        super().__init__(*args, **kwargs)
-        self.chem_pots = {}
-        self.offset_data = {}
-        self.offset_units = kwargs.get("offset_units", "atomic")
-        self.logger = kwargs.get("logger", logging.getLogger(__name__))
-
-    def get_surface_energy(
-        self,
-        atoms: ase.Atoms = None,
-        chem_pots: dict | None = None,
-        offset_data: dict | None = None,
-    ) -> float:
-        """Get the surface energy of the system by subtracting the bulk energy and the chemical
-        potential deviation from the bulk formula. Refer to Methods-Surface stability analysis
-        section of Du, X. et al. Nat Comput Sci 1-11 (2023) doi:10.1038/s43588-023-00571-7
-        for details.
-
-        Args:
-            atoms (ase.Atoms): The atoms object to calculate the surface energy for.
-            chem_pots (dict): The chemical potentials of the atoms in the system.
-            offset_data (dict): The offset data for the system.
-
-        Returns:
-            float: The surface energy of the system.
-        """
-        if atoms is None:
-            atoms = self.atoms
-
-        if chem_pots is None and self.chem_pots is not None:
-            chem_pots = self.chem_pots
-        else:
-            raise ValueError("chemical potentials are not set")
-
-        if offset_data is None and self.offset_data is not None:
-            offset_data = self.offset_data
-        else:
-            raise ValueError("offset data is not set")
-
-        # Starting with the potential energy of the system (akin to DFT energy of the slab)
-        surface_energy = self.get_potential_energy(atoms=atoms)
-
-        ads_count = Counter(atoms.get_chemical_symbols())
-
-        bulk_energies = offset_data["bulk_energies"]
-        stoics = offset_data["stoics"]
-        ref_formula = offset_data["ref_formula"]
-        ref_element = offset_data["ref_element"]
-
-        # Subtract the bulk energies
-        bulk_ref_en = ads_count[ref_element] * bulk_energies[ref_formula]
-        for ele in ads_count:
-            if ele != ref_element:
-                bulk_ref_en += (
-                    ads_count[ele] - stoics[ele] / stoics[ref_element] * ads_count[ref_element]
-                ) * bulk_energies[ele]
-
-        if self.offset_units == "atomic":
-            surface_energy -= bulk_ref_en * HARTREE_TO_EV
-        else:
-            surface_energy -= bulk_ref_en
-
-        # Subtract chemical potential deviation from bulk formula
-        stoics = self.offset_data["stoics"]
-        ref_element = self.offset_data["ref_element"]
-
-        pot = 0
-        for ele in ads_count:
-            if ele != ref_element:
-                pot += (
-                    ads_count[ele] - stoics[ele] / stoics[ref_element] * ads_count[ref_element]
-                ) * self.chem_pots[ele]
-
-        surface_energy -= pot
-        return surface_energy
-
-    def set(self, **kwargs) -> dict:
-        """Set parameters in key-value pairs. A dictionary containing the parameters that have been
-        changed is returned. The special keyword 'parameters' can be used to read parameters from a
-        file.
-
-        Args:
-            **kwargs: The parameters to set.
-
-        Returns:
-            dict: A dictionary containing the parameters that have been changed.
-        """
-        changed_parameters = EnsembleNFF.set(self, **kwargs)
-        if "chem_pots" in self.parameters:
-            self.chem_pots = self.parameters["chem_pots"]
-            self.logger.info("chemical potentials: %s are set from parameters", self.chem_pots)
-        if "offset_data" in self.parameters:
-            self.offset_data = self.parameters["offset_data"]
-            self.logger.info("offset data: %s is set from parameters", self.offset_data)
-        return changed_parameters
-
-    def calculate(
-        self,
-        atoms: ase.Atoms = None,
-        properties: tuple = implemented_properties,
-        system_changes: list = all_changes,
-    ):
-        """Caculate based on EnsembleNFF before add in surface energy calcs to results
-
-        Args:
-            atoms (ase.Atoms): The atoms object to calculate the properties for.
-            properties (tuple): The properties to calculate.
-            system_changes (list): The system changes to calculate.
-        """
-        if atoms is None:
-            atoms = self.atoms
-
-        EnsembleNFF.calculate(self, atoms, properties, system_changes)
-
-        if "surface_energy" in properties:
-            self.results["surface_energy"] = self.get_surface_energy(atoms=atoms)
-
-        atoms.results.update(self.results)
+# Backward-compatible aliases
+EnsembleNFFSurface = MACESurface
+NFFPourbaix = MACEPourbaix
 
 
 class LAMMMPSCalc(Calculator):

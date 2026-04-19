@@ -1,0 +1,33 @@
+#!/bin/bash
+#SBATCH --job-name=cusn-finetune
+#SBATCH --partition=gpu-shared
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus=1
+#SBATCH --mem=64G
+#SBATCH --time=02:00:00
+#SBATCH --account=sdp126
+#SBATCH --output=cusn_finetune.o%j.%N
+
+# Head-only MACE fine-tuning for CuSn system on Expanse GPU
+# Usage:
+#   TRAIN_FILE=train.xyz VALID_FILE=valid.xyz sbatch cusn_finetune.sb
+#   TRAIN_FILE=train.xyz VALID_FILE=valid.xyz OUTPUT=my_model.model sbatch cusn_finetune.sb
+
+WORK_DIR=/expanse/projects/qstore/csd807/gliu3/containers
+CONTAINER=${WORK_DIR}/mace-lammps-v3.sif
+EXTRA_PKGS=${WORK_DIR}/extra-packages
+
+export SINGULARITYENV_PYTHONPATH="${EXTRA_PKGS}"
+
+singularity exec --nv --bind ${EXTRA_PKGS} ${CONTAINER} \
+    python ${WORK_DIR}/examples/finetune_headonly.py \
+    --train_file "${TRAIN_FILE}" \
+    --valid_file "${VALID_FILE}" \
+    --foundation_model "${FOUNDATION_MODEL:-/expanse/projects/qstore/csd807/gliu3/ML-potentials/MACE-matpes-pbe-omat-ft.model}" \
+    --output "${OUTPUT:-MACE-cusn-finetuned.model}" \
+    --freeze_level f5 \
+    --epochs 30 \
+    --lr 0.001 \
+    --batch_size 4

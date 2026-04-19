@@ -1,76 +1,83 @@
 import numpy as np
 import torch
 from ase.atoms import Atoms
-from nff.data import Dataset, collate_dicts
-from nff.utils.cuda import batch_detach, batch_to
-from torch.utils.data import DataLoader
-from torch_scatter import scatter_sum
 
-# from vssr.calculators.base import EnsembleModel
-
-OUTPUT_KEYS = ["energy", "forces", "energy_grad", "embedding"]
+OUTPUT_KEYS = ["energy", "forces", "embedding"]
 
 
-def get_nff_prediction(
-    model,
-    dset: Dataset,
-    batch_size: int = 10,
+def get_mace_prediction(
+    calc,
+    atoms_list: list[Atoms],
     device: str = "cuda",
     output_keys=OUTPUT_KEYS,
     **kwargs,
-):
-    loader = DataLoader(
-        dset,
-        batch_size=batch_size,
-        collate_fn=collate_dicts,
-    )
-    model.to(device)
-    model.eval()
-    predicted, num_atoms = [], []
-    for batch in loader:
-        batch = batch_to(batch, device=device)
-        pred = model(batch, requires_embedding=True)
-        batch = batch_detach(batch)
-        pred_detached = batch_detach(pred)
-        num_atoms.extend(batch["num_atoms"])
+) -> dict:
+    """Get predictions from a MACE calculator on a list of Atoms.
 
-        predicted.append(pred_detached)
-    # if isinstance(model, EnsembleModel):
-    #     print("Getting std for values")
-    #     output_keys = output_keys + ["energy_std", "forces_std"]
-    #     predicted = {k: torch.concat([p[k] for p in predicted]) for k in predicted[0].keys() if k in output_keys}
-    # else:
-    print("Single Model")
+    Args:
+        calc: MACECalculator or MACESurface calculator.
+        atoms_list: List of ASE Atoms objects.
+        device: Device string (unused, calculator already has device).
+        output_keys: Keys to collect from results.
+
+    Returns:
+        dict: Collected predictions with keys from output_keys.
+    """
+    from mcmc.calculators.calculators import get_embeddings_single
+
+    energies = []
+    forces_list = []
+    embeddings = []
+
+    for atoms in atoms_list:
+        calc.calculate(atoms)
+        results = calc.results
+        energies.append(float(results["energy"]))
+        forces_list.append(results["forces"])
+
+        if "embedding" in output_keys:
+            emb = get_embeddings_single(atoms, calc, flatten=True)
+            embeddings.append(emb)
+
     predicted = {
-        k: torch.concat([p[k] for p in predicted]) for k in predicted[0].keys() if k in output_keys
+        "energy": torch.tensor(energies),
+        "forces": torch.tensor(np.concatenate(forces_list, axis=0)),
+        "num_atoms": torch.tensor([len(a) for a in atoms_list]),
     }
-    predicted["num_atoms"] = torch.as_tensor(num_atoms).view(-1)
-    if "forces" in output_keys and "energy_grad" in predicted:
-        predicted["forces"] = -predicted["energy_grad"]
-    elif "energy_grad" in output_keys and "forces" in predicted:
-        predicted["energy_grad"] = -predicted["forces"]
+    if embeddings:
+        predicted["embedding"] = torch.tensor(np.stack(embeddings))
+
     return predicted
 
 
+# Keep old name as alias
+get_nff_prediction = get_mace_prediction
+
+
 def get_prediction(
-    model,
-    dset: Dataset | list[Atoms],
+    calc,
+    dset: list[Atoms],
     batch_size: int = 10,
     device: str = "cuda",
     requires_grad: bool = False,
     **kwargs,
 ) -> tuple[dict, dict]:
-    # if "PaiNN" in model.__repr__() or "SchNet" in model.__repr__():
-    predicted = get_nff_prediction(model, dset, batch_size=batch_size, device=device, **kwargs)
+    """Get predictions and targets from a list of Atoms.
 
-    if isinstance(dset, Dataset):
-        target = {
-            "energy": dset.props["energy"],
-            "energy_grad": dset.props["energy_grad"],
-        }
-    else:
-        target = {"energy": [atoms.get_potential_energy() for atoms in dset]}
-        target["energy_grad"] = [-atoms.get_forces(apply_constraint=False) for atoms in dset]
+    Args:
+        calc: MACE calculator.
+        dset: List of ASE Atoms objects (with stored energies/forces as targets).
+        batch_size: Unused (kept for API compatibility).
+        device: Device string.
+        requires_grad: Unused.
+
+    Returns:
+        tuple[dict, dict]: (target, predicted) dictionaries.
+    """
+    predicted = get_mace_prediction(calc, dset, device=device, **kwargs)
+
+    target = {"energy": [atoms.get_potential_energy() for atoms in dset]}
+    target["energy_grad"] = [-atoms.get_forces(apply_constraint=False) for atoms in dset]
 
     target["energy_grad"] = np.concatenate(target["energy_grad"], axis=0)
 
@@ -124,54 +131,51 @@ def get_errors(predicted: dict, target: dict, mae=True, rmse=True, r2=True, max_
 
 
 def get_embedding(
-    model,
-    dset: Dataset,
-    batch_size: int,
-    device: str,
+    calc,
+    atoms_list: list[Atoms],
+    batch_size: int = 10,
+    device: str = "cuda",
 ) -> torch.Tensor:
-    loader = DataLoader(
-        dset,
-        batch_size=batch_size,
-        collate_fn=collate_dicts,
-        shuffle=False,
-    )
+    """Get embeddings from MACE calculator using forward hooks.
 
-    embedding = []
-    for batch in loader:
-        batch = batch_to(batch, device=device)
-        emb = model(batch, requires_embedding=True)["embedding"]
-        emb = emb.detach().cpu()
-        batch = batch_detach(batch)
-        center_idx = batch.get("center_idx", None)
-        if center_idx is not None:
-            # print(center_idx, emb.shape[0])
-            dummy_tensor = torch.tensor([0], device=emb.device, dtype=batch["num_atoms"].dtype)
-            num_atoms_added = torch.cumsum(batch["num_atoms"], dim=0)
-            added_tensor = torch.cat([dummy_tensor, num_atoms_added[:-1]], dim=0)
-            # print(batch["num_atoms"],  num_atoms_added[:-1], added_tensor,)
-            center_idx = center_idx + added_tensor
-            # print(center_idx)
-            system_emb = emb[center_idx]
-        else:
-            N = batch["num_atoms"].detach().cpu().tolist()
-            batch_idx = torch.arange(len(N)).repeat_interleave(torch.LongTensor(N)).to(emb.device)
-            system_emb = scatter_sum(emb, index=batch_idx, dim=0)
-        # if True in torch.isnan(system_emb):
-        #     print(batch["num_atoms"][~torch.isnan(system_emb)[:,0]])
-        embedding.append(system_emb)
+    Args:
+        calc: MACE calculator.
+        atoms_list: List of ASE Atoms objects.
+        batch_size: Unused (kept for API compatibility).
+        device: Device string.
 
-    embedding = torch.concat(embedding, dim=0)
+    Returns:
+        torch.Tensor: Embeddings tensor of shape (n_structures, embedding_dim).
+    """
+    from mcmc.calculators.calculators import get_embeddings_single
 
-    return embedding  # (n_atoms, n_atom_basis)
+    embeddings = []
+    for atoms in atoms_list:
+        emb = get_embeddings_single(atoms, calc, flatten=True)
+        embeddings.append(emb)
+
+    return torch.tensor(np.stack(embeddings))
 
 
 def get_prediction_and_errors(
-    model, dset: Dataset | list[Atoms], batch_size: int, device: str
+    calc, dset: list[Atoms], batch_size: int = 10, device: str = "cuda"
 ) -> tuple[dict, dict, dict]:
-    target, predicted = get_prediction(model, dset, batch_size, device)
+    """Get predictions, targets, and errors.
 
-    target = batch_detach(target)
-    predicted = batch_detach(predicted)
+    Args:
+        calc: MACE calculator.
+        dset: List of ASE Atoms objects.
+        batch_size: Unused (kept for API compatibility).
+        device: Device string.
+
+    Returns:
+        tuple[dict, dict, dict]: (target, predicted, errors).
+    """
+    target, predicted = get_prediction(calc, dset, batch_size, device)
+
+    # Detach tensors
+    target = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in target.items()}
+    predicted = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in predicted.items()}
 
     errors = get_errors(predicted, target, mae=True, rmse=True, r2=True, max_error=True)
 

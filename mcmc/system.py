@@ -4,7 +4,10 @@ import copy
 import functools
 import logging
 from collections.abc import Iterable
-from typing import Self
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 import ase
 import numpy as np
@@ -12,10 +15,17 @@ from ase import io
 from ase.calculators.calculator import Calculator, PropertyNotImplementedError
 from ase.constraints import FixAtoms, FixConstraint
 from ase.io.trajectory import TrajectoryWriter
-from catkit.gen.utils import get_unique_coordinates
-from nff.io.ase import AtomsBatch
-from pymatgen.analysis.adsorption import AdsorbateSiteFinder
-from pymatgen.core import Structure
+try:
+    from catkit.gen.utils import get_unique_coordinates
+except ImportError:
+    get_unique_coordinates = None
+
+try:
+    from pymatgen.analysis.adsorption import AdsorbateSiteFinder
+    from pymatgen.core import Structure
+except ImportError:
+    AdsorbateSiteFinder = None
+    Structure = None
 
 from mcmc.dynamics import optimize_slab
 from mcmc.utils import SilenceLogger
@@ -274,7 +284,8 @@ class SurfaceSystem:
         Returns:
             FixConstraint: The constraints on the surface.
         """
-        get_unique_coordinates(self.real_atoms, tag=True)
+        if get_unique_coordinates is not None:
+            get_unique_coordinates(self.real_atoms, tag=True)
         if self.surface_depth is not None:
             # clear existing constraints
             self.real_atoms.constraints = []
@@ -618,9 +629,7 @@ class SurfaceSystem:
         """
         # Logic for adsorbate group
         real_atoms_ads_group = dct["real_atoms"].pop("ads_group", None)
-        real_atoms = AtomsBatch.fromdict(
-            dct["real_atoms"]
-        )  # what if ase.Atoms was the original object?
+        real_atoms = ase.Atoms.fromdict(dct["real_atoms"])
         if real_atoms_ads_group is not None:
             real_atoms.set_array("ads_group", real_atoms_ads_group)
 
@@ -629,7 +638,7 @@ class SurfaceSystem:
             relaxed_atoms_ads_group = dct["relaxed_atoms"].pop("ads_group", None)
         else:
             relaxed_atoms_ads_group = None
-        relaxed_atoms = AtomsBatch.fromdict(dct["relaxed_atoms"]) if dct["relaxed_atoms"] else None
+        relaxed_atoms = ase.Atoms.fromdict(dct["relaxed_atoms"]) if dct["relaxed_atoms"] else None
         if relaxed_atoms_ads_group is not None:
             relaxed_atoms.set_array("ads_group", relaxed_atoms_ads_group)
         calc = dct["calc"]

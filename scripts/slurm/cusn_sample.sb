@@ -1,0 +1,36 @@
+#!/bin/bash
+#SBATCH --job-name=cusn-sample
+#SBATCH --partition=gpu-shared
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus=1
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
+#SBATCH --account=sdp126
+#SBATCH --output=cusn_sample.o%j.%N
+
+# CuSn Pourbaix surface sampling with MACE on Expanse GPU
+# Usage:
+#   sbatch cusn_sample.sb
+#   MODEL_PATH=/path/to/finetuned.model sbatch cusn_sample.sb
+
+WORK_DIR=/expanse/projects/qstore/csd807/gliu3/containers
+SURFACE_DIR=${WORK_DIR}/surface-sampling
+CONTAINER=${WORK_DIR}/mace-lammps-v3.sif
+EXTRA_PKGS=${WORK_DIR}/extra-packages
+
+# cuEquivariance for MACE GPU acceleration
+export SINGULARITYENV_PYTHONPATH="${EXTRA_PKGS}"
+
+cd ${SURFACE_DIR}
+
+singularity exec --nv --bind ${EXTRA_PKGS} ${CONTAINER} \
+    python scripts/sample_pourbaix_surface.py \
+    --run_name "CuSn_001_2x2" \
+    --starting_structure_path "data/CuSn_001/CuSn_001_pristine.pkl" \
+    --model_path "${MODEL_PATH:-/expanse/projects/qstore/csd807/gliu3/ML-potentials/MACE-matpes-pbe-omat-ft.model}" \
+    --phase_diagram_path "data/CuSn_001/CuSn_pd.json" \
+    --pourbaix_diagram_path "data/CuSn_001/CuSn_pbx.json" \
+    --settings_path "scripts/configs/sample_cusn_pourbaix_config.json" \
+    --device cuda

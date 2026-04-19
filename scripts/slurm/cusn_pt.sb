@@ -1,0 +1,66 @@
+#!/bin/bash
+#SBATCH --job-name=cusn-pt-mc
+#SBATCH --partition=gpu-shared
+#SBATCH --account=sdp126
+#SBATCH --gpus=1
+#SBATCH --mem=64G
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=12:00:00
+#SBATCH --output=pt.o%j.%x
+#SBATCH --export=ALL
+
+# ─── Paths ─────────────────────────────────────────────────────
+WORK_DIR="/expanse/projects/qstore/csd807/gliu3/containers"
+CONTAINER="${WORK_DIR}/mace-lammps-v3.sif"
+EXTRA_PKGS="${WORK_DIR}/extra-packages"
+SCRIPT_DIR="${WORK_DIR}/surface-sampling/scripts"
+
+MODEL_PATH="${MODEL_PATH:-${WORK_DIR}/ML-potentials/MACE-matpes-pbe-omat-ft.model}"
+
+# ─── Required inputs (set via env vars or defaults) ────────────
+STARTING_STRUCTURE="${STARTING_STRUCTURE:-pristine.pkl}"
+PHASE_DIAGRAM="${PHASE_DIAGRAM:-CuSn_pd.json}"
+POURBAIX_DIAGRAM="${POURBAIX_DIAGRAM:-CuSn_pbx.json}"
+SETTINGS="${SETTINGS:-${SCRIPT_DIR}/configs/sample_cusn_pourbaix_config.json}"
+RUN_NAME="${RUN_NAME:-CuSn_001_PT}"
+
+# ─── Parallel Tempering parameters ─────────────────────────────
+# 5 replicas spanning from low T (precise sampling) to high T (exploration)
+TEMPERATURES="${TEMPERATURES:-0.01 0.05 0.1 0.3 0.5}"
+SWAP_INTERVAL="${SWAP_INTERVAL:-1}"
+SWAP_SCHEME="${SWAP_SCHEME:-sequential}"
+PH="${PH:-7.0}"
+PHI="${PHI:-0.0}"
+
+# ─── Container environment ─────────────────────────────────────
+export SINGULARITYENV_PYTHONPATH="${EXTRA_PKGS}:${SCRIPT_DIR}"
+export SINGULARITYENV_RAY_TMPDIR="/tmp"
+export SINGULARITYENV_OMPI_MCA_orte_tmpdir_base="/tmp"
+
+echo "=== Parallel Tempering MC ==="
+echo "Temperatures: ${TEMPERATURES}"
+echo "Swap interval: ${SWAP_INTERVAL}"
+echo "pH=${PH}, phi=${PHI}"
+echo "Model: ${MODEL_PATH}"
+echo "Structure: ${STARTING_STRUCTURE}"
+
+singularity exec --nv \
+    --bind "${EXTRA_PKGS}:${EXTRA_PKGS}" \
+    "${CONTAINER}" \
+    python "${SCRIPT_DIR}/sample_pourbaix_pt.py" \
+        --run_name "${RUN_NAME}" \
+        --starting_structure_path "${STARTING_STRUCTURE}" \
+        --model_path "${MODEL_PATH}" \
+        --phase_diagram_path "${PHASE_DIAGRAM}" \
+        --pourbaix_diagram_path "${POURBAIX_DIAGRAM}" \
+        --settings_path "${SETTINGS}" \
+        --device cuda \
+        --pH "${PH}" \
+        --phi "${PHI}" \
+        --temperatures ${TEMPERATURES} \
+        --swap_interval "${SWAP_INTERVAL}" \
+        --swap_scheme "${SWAP_SCHEME}" \
+        --logging_level info
+
+echo "=== Done ==="

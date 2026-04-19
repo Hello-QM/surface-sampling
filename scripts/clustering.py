@@ -8,17 +8,15 @@ from typing import Literal
 
 import numpy as np
 import torch
-from nff.io.ase_calcs import EnsembleNFF, NeuralFF
-from nff.train.builders import load_model
-from nff.utils.cuda import cuda_devices_sorted_by_free_mem, detach
+from mace.calculators import MACECalculator
 from tqdm import tqdm
 
-from mcmc.calculators import get_embeddings_single, get_results_single, get_std_devs_single
+from mcmc.calculators import MACESurface, get_embeddings_single, get_results_single, get_std_devs_single
 from mcmc.system import SurfaceSystem
 from mcmc.uncertainty import Uncertainty
 from mcmc.utils import setup_logger
 from mcmc.utils.clustering import perform_clustering, select_data_and_save
-from mcmc.utils.misc import get_atoms_batch, load_dataset_from_files
+from mcmc.utils.misc import load_dataset_from_files
 
 np.set_printoptions(precision=3, suppress=True)
 
@@ -31,7 +29,7 @@ def parse_args():
     parser.add_argument(
         "--file_paths",
         nargs="+",
-        help="Full paths to NFF Dataset, ASE Atoms/NFF AtomsBatch, or a text file of file paths.",
+        help="Full paths to pickle files or XYZ files of structures.",
         type=Path,
     )
     parser.add_argument(
@@ -41,26 +39,11 @@ def parse_args():
         help="Folder to save cut surfaces.",
     )
     parser.add_argument(
-        "--nff_model_type",
-        choices=["PaiNN", "NffScaleMACE", "CHGNetNFF"],
-        default="CHGNetNFF",
-        help="NFF model type",
+        "--model_paths",
+        nargs="*",
+        help="Full paths to MACE model files",
         type=str,
-    )
-    parser.add_argument(
-        "--nff_paths", nargs="*", help="Full path to NFF model", type=str, default=[""]
-    )
-    parser.add_argument(
-        "--nff_cutoff",
-        help="NFF cutoff, should be consistent with NFF training cutoff",
-        type=float,
-        default=5.0,
-    )
-    parser.add_argument(
-        "--nff_device",
-        help="NFF device, either cpu or cuda",
-        type=str,
-        default="cpu",
+        default=[""],
     )
     parser.add_argument(
         "--max_input_len",
@@ -98,6 +81,12 @@ def parse_args():
         default=200,
     )
     parser.add_argument(
+        "--device",
+        help="Device, either cpu or cuda",
+        type=str,
+        default="cuda",
+    )
+    parser.add_argument(
         "--logging_level",
         type=str,
         choices=["debug", "info", "warning", "error", "critical"],
@@ -110,15 +99,13 @@ def parse_args():
 
 def main(
     file_names: list[str],
-    nff_cutoff: float = 5.0,
-    device: str = "cuda:0",
-    model_type: str = "CHGNetNFF",
+    device: str = "cuda",
     clustering_cutoff: float = 0.2,
     cutoff_criterion: Literal["distance", "maxclust"] = "distance",
     clustering_metric: Literal["force_std", "random", "energy", "gmm"] = "force_std",
     gmm_path: Path | str | None = None,
     max_input_len: int = 1000,
-    nff_paths: list[Path | str] | None = None,
+    model_paths: list[str] | None = None,
     save_folder: Path | str = "./",
     logging_level: Literal["debug", "info", "warning", "error", "critical"] = "info",
 ) -> None:
@@ -126,9 +113,7 @@ def main(
 
     Args:
         file_names (list[str]) : List of file paths to load structures from
-        nff_cutoff (float, optional) : Neighbor cutoff for the NFF model, by default 5.0
-        device (str, optional) : cpu or cuda device, by default 'cuda:0'
-        model_type (str, optional) : NFF model type, by default 'CHGNetNFF'
+        device (str, optional) : cpu or cuda device, by default 'cuda'
         clustering_cutoff (float, optional) : Either the distance or the maximum number of clusters,
             by default 0.2
         max_input_len (int, optional) : Maximum number of structures used in each clustering
@@ -136,7 +121,7 @@ def main(
         clustering_metric (Literal['force_std', 'random', 'energy', 'gmm'], optional) : Metric used
             to select structure from each cluster, by default 'force_std'
         gmm_path (Path | str, optional) : Full path to GMM model, by default None
-        nff_paths (list[Path, str], optional) : Full path to NFF model, by default None
+        model_paths (list[str], optional) : Full paths to MACE model files, by default None
         cutoff_criterion (Literal['distance', 'maxclust'], optional) : Either distance or maxclust,
             by default 'distance'
         save_folder (Union[Path, str], optional) : Folder to save the plots, by default "./"
@@ -165,41 +150,25 @@ def main(
         dset = [system.relaxed_atoms for system in dset]
         logger.info("Converted to list of Atoms objects")
 
-    if torch.cuda.is_available() and "cpu" not in device:
-        device = f"cuda:{cuda_devices_sorted_by_free_mem()[-1]}"
-    else:
-        device = "cpu"
-    logger.info("Using %s device for NFF calculations", device)
+    device = "cuda" if torch.cuda.is_available() and "cpu" not in device else "cpu"
+    logger.info("Using %s device for MACE calculations", device)
 
-    if nff_paths:
-        # Load existing models
-        logger.info("Loading existing models from %s", nff_paths)
-        models = [
-            load_model(
-                path,
-                model_type=model_type,
-                map_location=device,
-                requires_embedding=True,
-            )
-            for path in nff_paths
-        ]
+    if model_paths:
+        logger.info("Loading MACE models from %s", model_paths)
     else:
-        # raise error if no models are provided
-        raise ValueError("No NFF models provided")
-    # EnsembleNFF for force standard deviation prediction
-    ensemble_calc = EnsembleNFF(
-        models,
+        raise ValueError("No MACE models provided")
+
+    # MACESurface for ensemble force standard deviation
+    ensemble_calc = MACESurface(
+        model_paths,
         device=device,
-        model_units=models[0].units if model_type != "PaiNN" else "kcal/mol",
-        prediction_units="eV",
+        enable_cueq=True,
     )
-    # NeuralFF for latent space embedding calculation
-    single_calc = NeuralFF(
-        models[0],
+    # Single MACECalculator for embedding extraction
+    single_calc = MACECalculator(
+        model_paths=model_paths[0],
         device=device,
-        model_units=models[0].units if model_type != "PaiNN" else "kcal/mol",
-        prediction_units="eV",
-        properties=["energy", "forces", "embedding"],
+        enable_cueq=True,
     )
 
     # Load GMM if clustering metric is gmm
@@ -234,38 +203,32 @@ def main(
         embeddings = []
         metric_values = []
         for single_dset in tqdm(dset_batch):
-            atoms_batch = get_atoms_batch(single_dset, nff_cutoff, device=device)
-            single_calc_results = get_results_single(atoms_batch, single_calc)
+            single_calc.calculate(single_dset)
+            single_calc_results = single_calc.results
             embedding = get_embeddings_single(
-                atoms_batch,
+                single_dset,
                 single_calc,
                 results_cache=single_calc_results,
                 flatten=True,
                 flatten_axis=0,
             )
             if clustering_metric == "energy":
-                metric_value = single_calc_results["energy"].squeeze()
+                metric_value = float(single_calc_results["energy"])
             elif clustering_metric == "force_std":
-                metric_value = get_std_devs_single(atoms_batch, ensemble_calc)
+                metric_value = get_std_devs_single(single_dset, ensemble_calc)
             elif clustering_metric == "gmm":
-                props = atoms_batch.get_batch()
-                props["embedding"] = embedding
-                metric_value = detach(
-                    gmm_model(props, num_atoms=props["num_atoms"]), to_numpy=True
-                ).item()
+                # GMM on embedding
+                emb_tensor = torch.tensor(embedding).unsqueeze(0)
+                metric_value = float(gmm_model(
+                    {"embedding": emb_tensor},
+                    num_atoms=torch.tensor([len(single_dset)])
+                ).item())
             else:
                 metric_value = np.random.rand()
             embeddings.append(embedding)
             metric_values.append(metric_value)
         embeddings = np.stack(embeddings)
         metric_values = np.stack(metric_values)
-
-        # atoms_batches = get_atoms_batches(dset_batch, nff_cutoff, device=device)
-        # embeddings = get_embeddings(atoms_batches, single_calc)
-        # force_std_devs = get_std_devs(atoms_batches, ensemble_calc)
-
-        # # delete the AtomsBatch to free up memory
-        # del atoms_batches
 
         y = perform_clustering(
             embeddings, clustering_cutoff, cutoff_criterion, save_path, save_prepend, logger=logger
@@ -280,15 +243,13 @@ if __name__ == "__main__":
     args = parse_args()
     main(
         args.file_paths,
-        nff_cutoff=args.nff_cutoff,
-        device=args.nff_device,
-        model_type=args.nff_model_type,
+        device=args.device,
         clustering_cutoff=args.clustering_cutoff,
         cutoff_criterion=args.cutoff_criterion,
         clustering_metric=args.clustering_metric,
         gmm_path=args.gmm_path,
         max_input_len=args.max_input_len,
-        nff_paths=args.nff_paths,
+        model_paths=args.model_paths,
         save_folder=args.save_folder,
         logging_level=args.logging_level,
     )

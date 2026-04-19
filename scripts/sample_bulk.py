@@ -8,14 +8,11 @@ from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 
-from nff.io.ase_calcs import NeuralFF
-from nff.nn.models.chgnet import CHGNetNFF
-from nff.utils.cuda import cuda_devices_sorted_by_free_mem
+import torch
 
 from mcmc import MCMC
-from mcmc.calculators import EnsembleNFFSurface
+from mcmc.calculators import MACESurface
 from mcmc.system import SurfaceSystem
-from mcmc.utils.misc import get_atoms_batch
 
 logger = logging.getLogger("mcmc")
 logger.setLevel(logging.INFO)
@@ -39,11 +36,11 @@ def parse_args():
         help="Folder to save sampled surfaces.",
     )
     parser.add_argument(
-        "--nnids",
-        type=int,
+        "--model_paths",
+        type=str,
         nargs="+",
-        default=[2537, 2538, 2539],
-        help="ids of the nnpotentials to use",
+        default=[""],
+        help="paths to MACE model files",
     )
     parser.add_argument(
         "--chem_pot",
@@ -79,7 +76,7 @@ def parse_args():
 def main(
     starting_structure: Path | str,
     save_folder: Path,
-    nnids: list[int],
+    model_paths: list[str],
     chem_pot: list[float],
     sweeps: int,
     sweep_size: int,
@@ -96,7 +93,7 @@ def main(
     Args:
         starting_structure (Path | str): path to the starting structure
         save_folder (Path): Folder to save sampled surfaces.
-        nnids (list[int]): ids of the nnpotentials to use
+        model_paths (list[str]): paths to MACE model files
         chem_pot (list[float]): chemical potential for each element
         sweeps (int): MCMC sweeps
         sweep_size (int): MCMC steps (iterations) per sweep
@@ -111,7 +108,7 @@ def main(
     save_path = Path(save_folder)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    DEVICE = f"cuda:{cuda_devices_sorted_by_free_mem()[-1]}" if device == "cuda" else "cpu"
+    DEVICE = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
     try:
         with open(offset_data_path, "r") as f:
             offset_data = json.load(f)
@@ -121,11 +118,8 @@ def main(
 
     system_settings = {
         "surface_name": "SrIrO3_bulk",
-        "cutoff": 5.0,
+        "cutoff": 6.0,
         "device": DEVICE,
-        # "near_reduce": 0.01,
-        # "planar_distance": 1.55,
-        # "no_obtuse_hollow": True,
     }
 
     sampling_settings = {
@@ -136,7 +130,7 @@ def main(
     }
 
     calc_settings = {
-        "calc_name": "NFF",
+        "calc_name": "MACE",
         "chem_pots": {
             "Sr": chem_pot[0],
             "Ir": chem_pot[1],
@@ -157,24 +151,14 @@ def main(
     chem_symbols = cubic_cell_2x2x2.get_chemical_symbols()
     print(f"Chemical symbols: {chem_symbols}")
 
-    # Use Pretrained NFF model
-    chgnet_nff = CHGNetNFF.load(device=system_settings["device"])
-
-    nff_calc = NeuralFF(
-        chgnet_nff,
-        device=system_settings["device"],
-        model_units="eV/atom",
-        prediction_units="eV",
-    )
-
-    nff_surf_calc = EnsembleNFFSurface(
-        [nff_calc.model],
-        device=system_settings["device"],
-        model_units="eV/atom",
-        prediction_units="eV",
+    # Use MACE model
+    mace_surf_calc = MACESurface(
+        model_paths,
+        device=DEVICE,
+        enable_cueq=True,
         offset_units="eV",
     )
-    nff_surf_calc.set(**calc_settings)
+    mace_surf_calc.set(**calc_settings)
 
     # Initialize SurfaceSystem (actually bulk system)
     ads_positions = cubic_cell_2x2x2.get_positions()
@@ -186,41 +170,24 @@ def main(
     ads_positions = ads_positions[1:]
     ads_idx = ads_idx[1:]
 
-    # set attributes
-    slab_batch = get_atoms_batch(
-        cubic_cell_2x2x2,
-        nff_cutoff=system_settings["cutoff"],
-        device=system_settings["device"],
-        props={"energy": 0, "energy_grad": []},  # needed for NFF
-    )
-    # slab_batch = AtomsBatch(
-    #     cubic_cell_2x2x2,
-    #     cutoff=system_settings["cutoff"],
-    #     props={"energy": 0, "energy_grad": []},
-    #     calculator=nff_surf_calc,
-    #     requires_large_offsets=True,
-    #     directed=True,
-    #     device=DEVICE,
-    # )
-
     # Fake as adsorbate slab
-    slab_batch.set_tags([1] * len(slab_batch))
-    print(f"Tags are {slab_batch.get_tags()}")
+    cubic_cell_2x2x2.set_tags([1] * len(cubic_cell_2x2x2))
+    print(f"Tags are {cubic_cell_2x2x2.get_tags()}")
 
     bulk = SurfaceSystem(
-        slab_batch,
-        calc=nff_surf_calc,
+        cubic_cell_2x2x2,
+        calc=mace_surf_calc,
         ads_coords=ads_positions,
         occ=ads_idx,
         system_settings=system_settings,
     )
     bulk.all_atoms.write(save_path / "SrTiO3_2x2_bulk_starting.cif")
 
-    print(f"Starting chemical formula {slab_batch.get_chemical_formula()}")
+    print(f"Starting chemical formula {cubic_cell_2x2x2.get_chemical_formula()}")
 
-    print(f"NFF calc predicts {nff_calc.get_potential_energy(slab_batch)} eV")
+    print(f"MACE calc predicts {mace_surf_calc.get_potential_energy(cubic_cell_2x2x2)} eV")
 
-    print(f"Offset units: {nff_surf_calc.offset_units}")
+    print(f"Offset units: {mace_surf_calc.offset_units}")
 
     # Do different bulk defect sampling for the 2x2x2 cell
     # Sample across chemical potentials
@@ -229,7 +196,7 @@ def main(
     # Perform MCMC and view results.
     mcmc = MCMC(
         system_settings["surface_name"],
-        calc=nff_surf_calc,
+        calc=mace_surf_calc,
         canonical=False,
         testing=False,
         element=[],
@@ -278,7 +245,7 @@ if __name__ == "__main__":
     main(
         args.starting_structure,
         args.save_folder,
-        args.nnids,
+        args.model_paths,
         args.chem_pot,
         args.sweeps,
         args.sweep_size,

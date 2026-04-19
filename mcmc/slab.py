@@ -18,15 +18,24 @@ from mcmc.utils.plot import plot_specific_weights
 logger = logging.getLogger(__name__)
 
 
-# Define groups of atoms
+# Define groups of atoms. Geometry convention: the first atom is placed at
+# the adsorption site; subsequent atoms are offset from it in bonded-like
+# positions. For HO we put H ~0.98 Å from O and tilted upward (+z) so that
+# the O-Ir bond is not competed against by the H. For H2O we use bent C2v
+# geometry with the molecular plane tilted slightly upward.
+_OH = 0.98
+_ANG = math.radians(104.5 / 2.0)
 ATOM_GROUPS = {
-    "HO": Atoms("OH", positions=[[0, 0, 0], [1.0, 0, 0]]),
+    "HO": Atoms("OH", positions=[[0, 0, 0],
+                                 [_OH * math.sin(math.radians(30.0)),
+                                  0.0,
+                                  _OH * math.cos(math.radians(30.0))]]),
     "H2O": Atoms(
         "OHH",
         positions=[
             [0, 0, 0],
-            [1 / 2, -math.sqrt(3) / 2, 0],
-            [1 / 2, math.sqrt(3) / 2, 0],
+            [ _OH * math.sin(_ANG), 0.0,  _OH * math.cos(_ANG)],
+            [-_OH * math.sin(_ANG), 0.0,  _OH * math.cos(_ANG)],
         ],
     ),
 }

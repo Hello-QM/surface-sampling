@@ -9,11 +9,8 @@ from typing import Literal
 
 import ase
 import numpy as np
+import torch
 from monty.serialization import loadfn
-from nff.io.ase_calcs import EnsembleNFF
-from nff.train.builders.model import load_model
-from nff.utils.constants import HARTREE_TO_EV
-from nff.utils.cuda import get_final_device
 from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Structure
 from pymatgen.entries.compatibility import (
@@ -22,13 +19,15 @@ from pymatgen.entries.compatibility import (
 )
 from pymatgen.entries.computed_entries import ComputedStructureEntry
 
-from mcmc.calculators import get_results_single
+from mcmc.calculators import MACESurface, get_results_single
 from mcmc.dynamics import optimize_slab
 from mcmc.pourbaix.utils import SurfaceOHCompatibility
 from mcmc.utils import setup_logger
-from mcmc.utils.misc import get_atoms_batch, load_dataset_from_files
+from mcmc.utils.misc import load_dataset_from_files
 
 np.set_printoptions(precision=3, suppress=True)
+
+HARTREE_TO_EV = 27.211386245988
 
 SYMBOLS = {
     "La": "PAW_PBE La 06Sep2000",
@@ -73,14 +72,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--file_paths",
         nargs="+",
-        help="Full paths to NFF Dataset, ASE Atoms/NFF AtomsBatch, or a text file of file paths.",
+        help="Full paths to pickle or XYZ files of structures.",
         type=Path,
     )
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["NffScaleMACE", "CHGNetNFF", "DFT"],
-        default="NffScaleMACE",
+        choices=["MACE", "DFT"],
+        default="MACE",
         help="type of model to use",
     )
     parser.add_argument(
@@ -88,7 +87,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="*",
         default=[""],
-        help="paths to the models",
+        help="paths to MACE model files",
     )
     parser.add_argument(
         "--phase_diagram_path",
@@ -128,12 +127,6 @@ def parse_args() -> argparse.Namespace:
         "--aq_compat",
         action="store_true",
         help="use MaterialsProjectAqueousCompatibility",
-    )
-    parser.add_argument(
-        "--neighbor_cutoff",
-        type=float,
-        default=5.0,
-        help="cutoff for neighbor calculations",
     )
     parser.add_argument(
         "--input_slab_name",
@@ -222,7 +215,7 @@ def create_surface_formation_entry(
 def main(
     surface_name: str,
     file_names: list[str],
-    model_type: Literal["NffScaleMACE", "CHGNetNFF", "DFT"],
+    model_type: Literal["MACE", "DFT"],
     model_paths: list[str],
     phase_diagram_path: Path | str,
     pourbaix_diagram_path: Path | str,
@@ -231,21 +224,20 @@ def main(
     aq_compat: bool = False,
     input_slab_name: bool = False,
     input_job_id: bool = False,
-    neighbor_cutoff: float = 5.0,
     device: str = "cuda",
     relax: bool = False,
     relax_steps: int = 20,
     save_folder: str = "./",
     logging_level: Literal["debug", "info", "warning", "error", "critical"] = "info",
 ) -> None:
-    """Create pymatgen ComputedEntries for surface formation energies. Uses NFF models to predict
+    """Create pymatgen ComputedEntries for surface formation energies. Uses MACE models to predict
     energies. Relaxes the structures if relax is True.
 
     Args:
         surface_name (str): name of the surface
         file_names (list[str]): list of file paths to the ASE Atoms objects
-        model_type (Literal["NffScaleMACE", "CHGNetNFF", "DFT"]): type of model to use
-        model_paths (list[str]): list of paths to the models
+        model_type (Literal["MACE", "DFT"]): type of model to use
+        model_paths (list[str]): list of paths to MACE model files
         phase_diagram_path (Path | str): path to the saved pymatgen PhaseDiagram
         pourbaix_diagram_path (Path | str): path to the saved pymatgen PourbaixDiagram
         correct_hydroxide_energy (bool, optional): correct hydroxide energy (add ZPE-TS). Defaults
@@ -256,7 +248,6 @@ def main(
         input_slab_name (bool, optional): Input stoichiometry of the slab as the slab name. Defaults
             to False.
         input_job_id (bool, optional): Input job ID as the slab name. Defaults to False.
-        neighbor_cutoff (float, optional): cutoff for neighbor calculations. Defaults to 5.0.
         device (str, optional): device to use for calculations. Defaults to "cuda".
         relax (bool, optional): perform relaxation for the steps. Defaults to False.
         relax_steps (int, optional): max relaxation steps. Defaults to 20.
@@ -284,23 +275,18 @@ def main(
     all_structures = [s.relaxed_atoms if hasattr(s, "relaxed_atoms") else s for s in all_structures]
     logger.info("Loaded %d structures", len(all_structures))
 
-    device = get_final_device(device)
+    device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
     logger.info("Using device: %s", device)
 
     phase_diagram = loadfn(phase_diagram_path)
     # pourbaix_diagram = loadfn(pourbaix_diagram_path)
 
     if model_type not in ["DFT"]:
-        # Load Ensemble NFF Model
-        models = [
-            load_model(model_path, model_type=model_type, map_location=device)
-            for model_path in model_paths
-        ]
-        nff_calc = EnsembleNFF(
-            models,
+        # Load MACE ensemble calculator
+        mace_calc = MACESurface(
+            model_paths,
             device=device,
-            model_units=models[0].units,
-            prediction_units="eV",
+            enable_cueq=True,
         )
     else:
         # Set up compatibility adjustments
@@ -324,66 +310,55 @@ def main(
         )
 
     raw_entries = []
-    final_slab_batches = []
+    final_slabs = []
     surf_form_entries = []
 
     for i, slab in enumerate(all_structures):
         if model_type in ["DFT"]:
-            slab_batch = slab
             # try to get DFT energies
             try:
-                raw_energy = float(slab_batch.props["energy"]) * HARTREE_TO_EV  # convert to eV
-            except KeyError:
+                raw_energy = float(slab.info.get("energy", 0)) * HARTREE_TO_EV  # convert to eV
+            except (KeyError, AttributeError):
                 logger.error("No DFT energy found for %s", slab.get_chemical_formula())
                 continue
         else:
-            slab_batch = get_atoms_batch(
-                slab,
-                nff_cutoff=neighbor_cutoff,
-                device=device,
-                props={"energy": 0, "energy_grad": []},  # needed for NFF
-            )
-            slab_batch.set_calculator(nff_calc)
+            slab.calc = mace_calc
             if relax:
                 if i == 0:
                     logger.info("Relaxing the first slab")
                     # save before relaxation
-                    slab_batch.write(
-                        save_path / f"unrelaxed_{slab_batch.get_chemical_formula()}.cif"
+                    slab.write(
+                        save_path / f"unrelaxed_{slab.get_chemical_formula()}.cif"
                     )
-                slab_batch = optimize_slab(
-                    slab_batch,
+                slab = optimize_slab(
+                    slab,
                     optimizer="FIRE",
                     save_traj=False,
                     relax_steps=relax_steps,
                 )[0]
                 if i == 0:
                     # save after relaxation
-                    slab_batch.write(save_path / f"relaxed_{slab_batch.get_chemical_formula()}.cif")
-            results = get_results_single(slab_batch, nff_calc)
+                    slab.write(save_path / f"relaxed_{slab.get_chemical_formula()}.cif")
+            results = get_results_single(slab, mace_calc)
             raw_energy = float(results["energy"])  # DFT-like energy
 
         # Use constraints to set fake surface atoms so that they relax
-        if (len(slab_batch.constraints) > 0) and (
-            slab_batch.constraints[0].__class__.__name__ == "FixAtoms"
+        if (len(slab.constraints) > 0) and (
+            slab.constraints[0].__class__.__name__ == "FixAtoms"
         ):
-            fixed_indices = slab_batch.constraints[0].get_indices()
+            fixed_indices = slab.constraints[0].get_indices()
             surface_indices = np.isin(
-                np.arange(len(slab_batch)), fixed_indices, invert=True
+                np.arange(len(slab)), fixed_indices, invert=True
             ).astype(int)
-            slab_batch.set_tags(surface_indices)
-        final_slab_batches.append(slab_batch)
+            slab.set_tags(surface_indices)
+        final_slabs.append(slab)
         if input_slab_name:
-            slab_name = slab_batch.get_chemical_formula()
+            slab_name = slab.get_chemical_formula()
         elif input_job_id:
-            slab_name = (
-                slab_batch.props.get("job_id", None)
-                if hasattr(slab_batch, "props")
-                else slab_batch.info.get("job_id", None)
-            )
+            slab_name = slab.info.get("job_id", None)
         else:
             slab_name = None
-        raw_entry = create_computed_entry(slab_batch, raw_energy, slab_name=slab_name)
+        raw_entry = create_computed_entry(slab, raw_energy, slab_name=slab_name)
         print(f"Slab name: {raw_entry.formula}, raw energy: {raw_energy}")
 
         raw_entries.append(raw_entry)
@@ -410,17 +385,17 @@ def main(
         pkl.dump(surf_form_entries, f)
     logger.info("Create surface formation entries complete. Saved to %s", save_entries_path)
 
-    # Save final slab batches if relaxed
+    # Save final slabs if relaxed
     if relax:
-        save_slab_batches_path = (
-            save_path / f"{file_base}_{relaxed}_slab_batches_{len(final_slab_batches)}.pkl"
+        save_slabs_path = (
+            save_path / f"{file_base}_{relaxed}_slab_batches_{len(final_slabs)}.pkl"
         )
-        with open(save_slab_batches_path, "wb") as f:
-            pkl.dump(final_slab_batches, f)
+        with open(save_slabs_path, "wb") as f:
+            pkl.dump(final_slabs, f)
         logger.info(
-            "Saved final slab batches to %s. Total number of slabs: %d",
-            save_slab_batches_path,
-            len(final_slab_batches),
+            "Saved final slabs to %s. Total number of slabs: %d",
+            save_slabs_path,
+            len(final_slabs),
         )
 
 
@@ -438,7 +413,6 @@ if __name__ == "__main__":
         args.aq_compat,
         args.input_slab_name,
         args.input_job_id,
-        args.neighbor_cutoff,
         args.device,
         args.relax,
         args.relax_steps,

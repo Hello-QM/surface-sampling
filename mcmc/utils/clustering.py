@@ -9,8 +9,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from ase import Atoms
-from nff.data import Dataset
-from nff.data.dataset import concatenate_dict
 from scipy.cluster.hierarchy import fcluster, linkage
 from sklearn.decomposition import PCA
 
@@ -146,13 +144,9 @@ def select_data_and_save(
     selected_atoms = [atoms_batches[x] for x in selected_indices.tolist()]
 
     logger.info("Saving %d Atoms objects", len(selected_atoms))
-    if len(selected_atoms) >= 1 and isinstance(selected_atoms[0], Atoms):
-        clustered_atom_files = os.path.join(save_folder, save_prepend + "clustered.pkl")
-        with open(clustered_atom_files, "wb") as f:
-            pkl.dump(selected_atoms.copy(), f)
-    else:
-        clustered_atom_files = os.path.join(save_folder, save_prepend + "clustered.pth.tar")
-        Dataset(concatenate_dict(*selected_atoms)).save(clustered_atom_files)
+    clustered_atom_files = os.path.join(save_folder, save_prepend + "clustered.pkl")
+    with open(clustered_atom_files, "wb") as f:
+        pkl.dump(selected_atoms.copy(), f)
 
     logger.info("Saved to %s", clustered_atom_files)
 

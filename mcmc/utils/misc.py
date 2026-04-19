@@ -5,9 +5,8 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
+from ase import io
 from ase.atoms import Atoms
-from nff.data import Dataset
-from nff.io.ase import AtomsBatch
 from scipy.spatial import distance
 from scipy.special import softmax
 from tqdm import tqdm
@@ -15,81 +14,58 @@ from tqdm import tqdm
 
 def get_atoms_batch(
     data: dict | Atoms,
-    nff_cutoff: float,
+    nff_cutoff: float = 6.0,
     device: str = "cpu",
     **kwargs,
-) -> AtomsBatch:
-    """Generate AtomsBatch from atoms or dictionary.
+) -> Atoms:
+    """Return an ASE Atoms object from atoms or dictionary.
+
+    MACE handles neighbor lists internally, so no AtomsBatch wrapping is needed.
+    This function is kept for API compatibility.
 
     Args:
         data (Union[dict, Atoms]): Dictionary or ASE Atoms containing the properties of the atoms
-        nff_cutoff (float): Neighbor cutoff for the NFF model
-        device (str, optional): cpu or cuda device. Defaults to 'cpu'.
-        **kwargs: Additional keyword arguments.
+        nff_cutoff (float): Unused (kept for API compatibility). Defaults to 6.0.
+        device (str, optional): Unused (kept for API compatibility). Defaults to 'cpu'.
+        **kwargs: Additional keyword arguments (ignored).
 
     Returns:
-        AtomsBatch
+        Atoms: Plain ASE Atoms object.
     """
     if isinstance(data, Atoms):
-        atoms_batch = AtomsBatch.from_atoms(
-            data,
-            cutoff=nff_cutoff,
-            requires_large_offsets=False,
-            dense_nbrs=False,
-            directed=True,
-            device=device,
-            **kwargs,
-        )
-    else:
-        pass
-        # atoms_batch = AtomsBatch.from_dict(
-        #     data,
-        #     cutoff=nff_cutoff,
-        #     requires_large_offsets=False,
-        #     directed=True,
-        #     device=device,
-        #     **kwargs,
-        # )
-    return atoms_batch
+        return data
+    # dict case: reconstruct Atoms from dictionary
+    return Atoms.fromdict(data)
 
 
 def get_atoms_batches(
-    data: Dataset | list[Atoms],
-    nff_cutoff: float,
+    data: list[Atoms],
+    nff_cutoff: float = 6.0,
     device: str = "cpu",
     structures_per_batch: int = 32,
     **kwargs,
-) -> list[AtomsBatch]:
-    """Generate AtomsBatch
+) -> list[Atoms]:
+    """Return a list of ASE Atoms objects.
+
+    MACE handles neighbor lists internally, so no AtomsBatch wrapping is needed.
+    This function is kept for API compatibility.
 
     Args:
-        data (Union[Dataset, list[ase.Atoms]]): Dictionary or list of ase Atoms containing the
-            properties of the atoms
-        nff_cutoff (float): Neighbor cutoff for the NFF model
-        device (str, optional): cpu or cuda device. Defaults to 'cpu'.
-        structures_per_batch (int, optional): Number of structures per batch. Defaults to 32.
-        **kwargs: Additional keyword arguments.
+        data (list[ase.Atoms]): List of ASE Atoms objects.
+        nff_cutoff (float): Unused (kept for API compatibility). Defaults to 6.0.
+        device (str, optional): Unused (kept for API compatibility). Defaults to 'cpu'.
+        structures_per_batch (int, optional): Unused. Defaults to 32.
+        **kwargs: Additional keyword arguments (ignored).
 
     Returns:
-        list[AtomsBatch]: List of AtomsBatch objects.
+        list[Atoms]: List of ASE Atoms objects.
     """
     print(f"Data has length {len(data)}")
-
-    if isinstance(data, Dataset):
-        atoms_batches = data.as_atoms_batches()
-    else:
-        atoms_batches = []
-        # TODO: select structures_per_batch structures at a time
-        for atoms in tqdm(data):
-            atoms_batch = get_atoms_batch(atoms, nff_cutoff, device, **kwargs)
-            atoms_batches.append(atoms_batch)
-
-    return atoms_batches
+    return list(data)
 
 
 def load_dataset_from_files(file_paths: list[Path | str]) -> list[Atoms]:
-    """Load dataset from files. Dataset can be a list of ASE Atoms objects, an NFF Dataset
-    or a list of file paths.
+    """Load dataset from files. Dataset can be a list of ASE Atoms objects or pickle files.
 
     Args:
         file_paths (list[Path]): List of file paths.
@@ -109,9 +85,17 @@ def load_dataset_from_files(file_paths: list[Path | str]) -> list[Atoms]:
         elif x.suffix == ".pkl":
             with open(x, "rb") as f:
                 dset.extend(pkl.load(f))
-        else:  # .pth.tar
-            data = Dataset.from_file(x)
-            dset.extend(data)
+        elif x.suffix == ".xyz":
+            atoms_list = io.read(str(x), index=":")
+            dset.extend(atoms_list)
+        else:
+            # Try pickle for .pth.tar and other formats
+            with open(x, "rb") as f:
+                data = pkl.load(f)
+            if isinstance(data, list):
+                dset.extend(data)
+            else:
+                dset.append(data)
     return dset
 
 

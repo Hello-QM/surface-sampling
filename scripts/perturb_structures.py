@@ -8,13 +8,12 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from nff.io.ase_calcs import EnsembleNFF
-from nff.train.builders.model import load_model
-from nff.utils.cuda import get_final_device
+import torch
 from tqdm import tqdm
 
+from mcmc.calculators import MACESurface
 from mcmc.utils import setup_logger
-from mcmc.utils.misc import get_atoms_batch, load_dataset_from_files, randomize_structure
+from mcmc.utils.misc import load_dataset_from_files, randomize_structure
 from mcmc.utils.plot import plot_surfaces
 
 
@@ -24,7 +23,7 @@ def parse_args():
     parser.add_argument(
         "--file_paths",
         nargs="+",
-        help="Full paths to NFF Dataset or ASE Atoms/NFF AtomsBatch",
+        help="Full paths to pickle or XYZ files of structures",
         type=Path,
     )
     parser.add_argument(
@@ -39,24 +38,11 @@ def parse_args():
         help="Whether to estimate energy before and after perturbation.",
     )
     parser.add_argument(
-        "--model_type",
-        type=str,
-        choices=["NffScaleMACE", "CHGNetNFF", "DFT"],
-        default="NffScaleMACE",
-        help="type of model to use",
-    )
-    parser.add_argument(
         "--model_paths",
         type=str,
         nargs="*",
         default=[""],
-        help="paths to the models",
-    )
-    parser.add_argument(
-        "--neighbor_cutoff",
-        type=float,
-        default=5.0,
-        help="cutoff for neighbor calculations",
+        help="paths to MACE model files",
     )
     parser.add_argument(
         "--amplitude",
@@ -95,9 +81,7 @@ def parse_args():
 def main(
     file_names: list[str],
     energy_estimate: bool = False,
-    model_type: str = "NffScaleMACE",
     model_paths: list[str] = (""),
-    neighbor_cutoff: float = 5.0,
     amplitude: float = 0.3,
     displace_lattice: bool = True,
     repeats: int = 1,
@@ -111,9 +95,7 @@ def main(
         file_names: List of file paths to load structures from.
         energy_estimate: Whether to estimate energy before and after perturbation.
             Defaults to False.
-        model_type: Type of model to use. Defaults to "NffScaleMACE".
-        model_paths: Paths to the models. Defaults to [""].
-        neighbor_cutoff: Cutoff for neighbor calculations. Defaults to 5.0.
+        model_paths: Paths to MACE model files. Defaults to [""].
         amplitude: Max value of amplitude displacement in Angstroms. Defaults to 0.3.
         displace_lattice: Whether to displace the lattice. Defaults to True.
         repeats: Number of times to repeat perturbation.
@@ -137,17 +119,12 @@ def main(
 
     # Initialize models
     if energy_estimate:
-        device = get_final_device(device)
+        device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
         logger.info("Using device: %s", device)
-        models = [
-            load_model(model_path, model_type=model_type, map_location=device)
-            for model_path in model_paths
-        ]
-        nff_calc = EnsembleNFF(
-            models,
+        mace_calc = MACESurface(
+            model_paths,
             device=device,
-            model_units=models[0].units,
-            prediction_units="eV",
+            enable_cueq=True,
         )
 
     logger.info("There are a total of %d input files", len(file_names))
@@ -163,28 +140,16 @@ def main(
         # Estimate energy before perturbation
         if energy_estimate:
             logger.info("Estimating energy before perturbation")
-            atoms_batch = get_atoms_batch(
-                atoms,
-                nff_cutoff=neighbor_cutoff,
-                device=device,
-                props={"energy": 0, "energy_grad": []},  # needed for NFF
-            )
-            nff_calc.calculate(atoms_batch)
-            logger.info("Energy before perturbation: %.3f", float(nff_calc.results["energy"]))
-            energies_before.append(float(nff_calc.results["energy"]))
+            mace_calc.calculate(atoms)
+            logger.info("Energy before perturbation: %.3f", float(mace_calc.results["energy"]))
+            energies_before.append(float(mace_calc.results["energy"]))
         perturbed_atoms = randomize_structure(atoms, amplitude, displace_lattice=displace_lattice)
         # Estimate energy after perturbation
         if energy_estimate:
             logger.info("Estimating energy after perturbation")
-            atoms_batch = get_atoms_batch(
-                perturbed_atoms,
-                nff_cutoff=neighbor_cutoff,
-                device=device,
-                props={"energy": 0, "energy_grad": []},  # needed for NFF
-            )
-            nff_calc.calculate(atoms_batch)
-            logger.info("Energy after perturbation: %.3f", float(nff_calc.results["energy"]))
-            energies_after.append(float(nff_calc.results["energy"]))
+            mace_calc.calculate(perturbed_atoms)
+            logger.info("Energy after perturbation: %.3f", float(mace_calc.results["energy"]))
+            energies_after.append(float(mace_calc.results["energy"]))
         perturbed_structures.append(perturbed_atoms)
 
     if energy_estimate:
@@ -226,9 +191,7 @@ if __name__ == "__main__":
     main(
         args.file_paths,
         args.energy_estimate,
-        args.model_type,
         args.model_paths,
-        args.neighbor_cutoff,
         args.amplitude,
         args.displace_lattice,
         args.repeats,

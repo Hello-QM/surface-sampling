@@ -1,16 +1,18 @@
 """Pourbaix atoms module for calculating the Pourbaix potential (energy)."""
 
 from pathlib import Path
-from typing import Self
+
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 from ase import Atom
 from monty.serialization import loadfn
 from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.analysis.pourbaix_diagram import (
-    HydrogenPourbaixEntry,
     IonEntry,
     MultiEntry,
-    OxygenPourbaixEntry,
     PourbaixDiagram,
     PourbaixEntry,
 )
@@ -20,6 +22,44 @@ from pymatgen.entries.computed_entries import ComputedEntry
 
 ELEMENTS_HO = {Element("H"), Element("O")}
 SYMBOLS_HO = {elem.symbol for elem in ELEMENTS_HO}
+
+# Patch PourbaixEntry.normalization_factor for pymatgen >= 2024.10
+# H/O-only entries (H2O, H+) cause ZeroDivisionError because
+# normalization_factor divides by (num_atoms - nH - nO) which is 0.
+_orig_nf = PourbaixEntry.normalization_factor.fget
+
+@property
+def _safe_normalization_factor(self):
+    try:
+        return _orig_nf(self)
+    except ZeroDivisionError:
+        return 1.0 / max(self.num_atoms, 1)
+
+PourbaixEntry.normalization_factor = _safe_normalization_factor
+
+
+def _get_normalized_npH(entry: PourbaixEntry) -> float:
+    """Get normalized npH, handling H and O special entries."""
+    try:
+        return entry.npH * entry.normalization_factor
+    except ZeroDivisionError:
+        return entry.npH
+
+
+def _get_normalized_nPhi(entry: PourbaixEntry) -> float:
+    """Get normalized nPhi, handling H and O special entries."""
+    try:
+        return entry.nPhi * entry.normalization_factor
+    except ZeroDivisionError:
+        return entry.nPhi
+
+
+def _get_normalization_factor(entry: PourbaixEntry) -> float:
+    """Get normalization factor, handling H and O special entries."""
+    try:
+        return entry.normalization_factor
+    except ZeroDivisionError:
+        return 1.0
 
 
 class PourbaixAtom(Atom):
@@ -47,14 +87,6 @@ class PourbaixAtom(Atom):
             atom_std_state_energy (float): Atom standard state energy.
             delta_G2_std (float): Delta G2 standard.
             **kwargs: Additional keyword arguments.
-
-        Attributes:
-            dominant_species (str): Dominant species of the atom.
-            species_conc (float): Concentration of the species.
-            num_e (int): Number of electrons.
-            num_H (int): Number of protons.
-            atom_std_state_energy (float): Atom standard state energy.
-            delta_G2_std (float): Delta G2 standard.
         """
         super().__init__(symbol, **kwargs)
         self.dominant_species = dominant_species
@@ -67,7 +99,6 @@ class PourbaixAtom(Atom):
     @property
     def get_dominant_species(self):
         """Get the dominant species."""
-        # TODO return based on pH and phi
         return self.dominant_species
 
     @classmethod
@@ -83,21 +114,82 @@ class PourbaixAtom(Atom):
         Args:
             symbol (str): Chemical symbol of the atom.
             pbx_entry (PourbaixEntry): pymatgen PourbaixEntry object.
-            phase_diagram (PhaseDiagram): pymatgen PhaseDiagram object based on which the
-                PourbaixEntry was created.
+            phase_diagram (PhaseDiagram): pymatgen PhaseDiagram object.
             **kwargs: Additional keyword arguments.
 
         Returns:
             PourbaixAtom: PourbaixAtom object.
         """
+        norm_factor = _get_normalization_factor(pbx_entry)
+
+        # PourbaixEntry.energy contains the DFT total energy of the
+        # dissolution product minus the H2O chemical potential correction:
+        #   energy = E_DFT(product) - nH2O * MU_H2O + conc_term
+        #
+        # delta_G2_std must be the standard free energy change for the
+        # dissolution half-reaction (per non-H/O atom):
+        #   A(element) + nH2O H2O -> product + nH+ H+ + ne- e-
+        #   delta_G2_std = G_f(product) - nH2O * MU_H2O   (per non-H/O atom)
+        #
+        # where G_f(product) is the FORMATION energy from elements.
+        # We must subtract the elemental reference energies from the
+        # DFT total energy to obtain the formation energy.
+        #
+        # For H2O and H+ entries (created manually with formation
+        # energies in generate_pourbaix_atoms), the reference energies
+        # are already subtracted and this correction is zero.
+        comp = pbx_entry.entry.composition
+        ref_energy_sum = sum(
+            comp.get(el, 0) * phase_diagram.el_refs[el].energy_per_atom
+            for el in phase_diagram.el_refs
+            if comp.get(el, 0) > 0
+        )
+        n_non_HO = sum(
+            comp.get(el, 0)
+            for el in comp.elements
+            if el.symbol not in ("H", "O")
+        )
+        if n_non_HO > 0:
+            ref_per_metal = ref_energy_sum / n_non_HO
+        else:
+            # H/O-only entries (H2O, H+): no metal reference to subtract
+            ref_per_metal = 0.0
+
+        raw_energy = (pbx_entry.energy - pbx_entry.conc_term) * norm_factor
+
+        # Detect whether the entry uses total DFT energies or formation energies.
+        #
+        # Entries from mpr.get_pourbaix_entries(): energy is on the formation
+        # energy scale (Ir metal = 0, IrO2 ~ 3.5 eV, IrO4^2- ~ 5.5 eV).
+        # No reference subtraction needed.
+        #
+        # Entries manually built from phase_diagram.stable_entries via
+        # ComputedEntry: energy is on the total DFT scale (Ir ~ -8.8 eV,
+        # IrO2 ~ -35 eV). Must subtract elemental references.
+        #
+        # Detection: IonEntry always uses formation energy. For ComputedEntry,
+        # check if the elemental entry has energy ≈ 0 (formation) or large
+        # negative (total DFT). Elemental entries (like Ir metal) have
+        # formation energy = 0 by definition, so if energy ≈ 0 it's formation scale.
+        from pymatgen.analysis.pourbaix_diagram import IonEntry
+        is_ion = isinstance(pbx_entry.entry, IonEntry)
+        is_formation_scale = is_ion or (n_non_HO > 0 and raw_energy > -5.0)
+
+        if n_non_HO > 0 and not is_formation_scale:
+            delta_G2_std = raw_energy - ref_per_metal
+        else:
+            delta_G2_std = raw_energy
+
         return cls(
             symbol,
             dominant_species=pbx_entry.entry.reduced_formula,
             species_conc=pbx_entry.concentration,
-            num_e=-pbx_entry.normalized_nPhi,
-            num_H=-pbx_entry.normalized_npH,
-            atom_std_state_energy=phase_diagram.get_reference_energy_per_atom(Composition(symbol)),
-            delta_G2_std=(pbx_entry.energy - pbx_entry.conc_term) * pbx_entry.normalization_factor,
+            num_e=-_get_normalized_nPhi(pbx_entry),
+            num_H=-_get_normalized_npH(pbx_entry),
+            atom_std_state_energy=phase_diagram.get_reference_energy_per_atom(
+                Composition(symbol)
+            ),
+            delta_G2_std=delta_G2_std,
             **kwargs,
         )
 
@@ -117,12 +209,7 @@ class PourbaixAtom(Atom):
 
     @classmethod
     def from_dict(cls, dct: dict) -> Self:
-        """Args:
-            dct (dict): Dict representation.
-
-        Returns:
-            SurfacePourbaixDiagram
-        """
+        """Create from dict representation."""
         return cls(
             symbol=dct["symbol"],
             dominant_species=dct["dominant_species"],
@@ -150,38 +237,40 @@ def generate_pourbaix_atoms(
     pH: float,
     elements: list[str],
 ) -> dict[str, PourbaixAtom]:
-    """Generate Pourbaix atoms representing the dominant species for the given elements at the given
-    pH and phi.
+    """Generate Pourbaix atoms representing the dominant species for the given elements.
 
     Args:
-        phase_diagram (PhaseDiagram | str | Path): pymatgen PhaseDiagram or path to the file
-        pourbaix_diagram (PourbaixDiagram | str | Path): pymatgen PourbaixDiagram or path to
-            the file
-        phi (float): electrical potential
-        pH (float): pH
-        elements (list[str]): list of elements
+        phase_diagram: pymatgen PhaseDiagram or path to file.
+        pourbaix_diagram: pymatgen PourbaixDiagram or path to file.
+        phi: electrical potential (V vs SHE).
+        pH: pH value.
+        elements: list of element symbols.
 
     Returns:
-        dict: dictionary of PourbaixAtom objects
+        dict: {element_symbol: PourbaixAtom} for each element.
     """
     if not isinstance(phase_diagram, PhaseDiagram):
         phase_diagram = loadfn(phase_diagram)
     if not isinstance(pourbaix_diagram, PourbaixDiagram):
         pourbaix_diagram = loadfn(pourbaix_diagram)
+
     input_pbx_entry = pourbaix_diagram.get_stable_entry(pH, phi)
     if isinstance(input_pbx_entry, MultiEntry):
         sorted_pbx_entries = sorted(
-            input_pbx_entry.entry_list,  # there should be only 1 non-OH element per entry
-            key=lambda entry: list(set(entry.composition.elements) - ELEMENTS_HO).pop().symbol,
+            input_pbx_entry.entry_list,
+            key=lambda entry: list(
+                set(entry.composition.elements) - ELEMENTS_HO
+            ).pop().symbol,
         )
     else:
         sorted_pbx_entries = [input_pbx_entry]
     sorted_symbols = sorted(set(elements) - SYMBOLS_HO)
 
-    # H2O entry
-    # for the reaction: 1/2 O2 or O -> H2O - 2H+ - 2e-
-    H2O_entry = next(x for x in phase_diagram.stable_entries if x.reduced_formula == "H2O")
-    H2O_pourbaix_entry = OxygenPourbaixEntry(
+    # H2O entry: O -> H2O - 2H+ - 2e-
+    H2O_entry = next(
+        x for x in phase_diagram.stable_entries if x.reduced_formula == "H2O"
+    )
+    H2O_pourbaix_entry = PourbaixEntry(
         ComputedEntry(
             H2O_entry.composition,
             phase_diagram.get_form_energy(H2O_entry),
@@ -189,9 +278,10 @@ def generate_pourbaix_atoms(
         )
     )
 
-    # H+ entry
-    # for the reaction: 1/2 H2 or H -> H+ + e-
-    H_ion_pourbaix_entry = HydrogenPourbaixEntry(IonEntry(Ion.from_formula("H[1+]"), 0.0))
+    # H+ entry: H -> H+ + e-
+    H_ion_pourbaix_entry = PourbaixEntry(
+        IonEntry(Ion.from_formula("H[1+]"), 0.0)
+    )
 
     sorted_symbols += ["O", "H"]
     sorted_pbx_entries += [H2O_pourbaix_entry, H_ion_pourbaix_entry]

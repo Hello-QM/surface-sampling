@@ -1,62 +1,57 @@
 import ase
 import numpy as np
-import torch
 from ase import Atoms
-from nff.data import Dataset, concatenate_dict
-from nff.io.ase import AtomsBatch
-from nff.utils.constants import EV_TO_KCAL_MOL, HARTREE_TO_KCAL_MOL
 
-HARTREE_TO_EV = HARTREE_TO_KCAL_MOL / EV_TO_KCAL_MOL
+HARTREE_TO_EV = 27.211386245988
 
 
-def make_uncertainty_dataset(atoms_list: list[Atoms], cutoff) -> Dataset:
-    new_dict_list = []
-    for atoms in atoms_list:
-        atoms_batch = AtomsBatch.from_atoms(
-            atoms,
-            cutoff=cutoff,
-            requires_large_offsets=False,
-            device="cpu",
-            dense_nbrs=False,
-            directed=True,
-        )
-        new_dict_list.append(atoms_batch.get_batch())
-    new_dicts = concatenate_dict(*new_dict_list)
-    dataset = Dataset(new_dicts)
-    return dataset
+def make_uncertainty_dataset(atoms_list: list[Atoms], cutoff=6.0) -> list[Atoms]:
+    """Prepare atoms for uncertainty calculations.
+
+    MACE works directly with ASE Atoms, so no special dataset wrapping is needed.
+
+    Args:
+        atoms_list: List of ASE Atoms objects.
+        cutoff: Unused (kept for API compatibility).
+
+    Returns:
+        list[Atoms]: The same list of Atoms objects.
+    """
+    return list(atoms_list)
 
 
-def shrink_uncertainty_dataset(dataset: Dataset, indices) -> Dataset:
-    new_dict_list = []
-    new_dict_list = []
-    for idx in indices:
-        data = dataset[idx]
-        new_dict_list.append(data)
-    new_dicts = concatenate_dict(*new_dict_list)
-    dataset = Dataset(new_dicts)
-    return dataset
+def shrink_uncertainty_dataset(dataset: list[Atoms], indices) -> list[Atoms]:
+    """Select a subset of atoms from the dataset by indices.
+
+    Args:
+        dataset: List of ASE Atoms objects.
+        indices: Indices to select.
+
+    Returns:
+        list[Atoms]: Selected subset.
+    """
+    return [dataset[idx] for idx in indices]
 
 
 def make_clustering_dataset(
-    atoms_list: list[Atoms], center_atom_index_list: list[int], cutoff: float
-) -> Dataset:
-    new_dict_list = []
+    atoms_list: list[Atoms], center_atom_index_list: list[int], cutoff: float = 6.0
+) -> list[Atoms]:
+    """Prepare atoms for clustering with center atom indices stored in atoms.info.
+
+    Args:
+        atoms_list: List of ASE Atoms objects.
+        center_atom_index_list: List of center atom indices for each structure.
+        cutoff: Unused (kept for API compatibility).
+
+    Returns:
+        list[Atoms]: Atoms with center_idx stored in atoms.info.
+    """
+    result = []
     for i, atoms in enumerate(atoms_list):
-        atoms_batch = AtomsBatch.from_atoms(
-            atoms,
-            cutoff=cutoff,
-            requires_large_offsets=False,
-            device="cpu",
-            dense_nbrs=False,
-            directed=True,
-        )
-        batch = atoms_batch.get_batch()
-        # print(i, center_atom_index_list[i], type(center_atom_index_list[i]))
-        batch["center_idx"] = torch.tensor(center_atom_index_list[i], dtype=torch.long)
-        new_dict_list.append(batch)
-    new_dicts = concatenate_dict(*new_dict_list)
-    dataset = Dataset(new_dicts)
-    return dataset
+        atoms_copy = atoms.copy()
+        atoms_copy.info["center_idx"] = center_atom_index_list[i]
+        result.append(atoms_copy)
+    return result
 
 
 def preprocess_traj(

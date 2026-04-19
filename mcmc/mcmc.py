@@ -16,11 +16,17 @@ from mcmc.events.event import Change, Exchange
 from mcmc.events.proposal import ChangeProposal, SwitchProposal
 from mcmc.system import SurfaceSystem
 from mcmc.utils import create_anneal_schedule, setup_folders
-from mcmc.utils.clustering import (
-    find_closest_points_indices,
-    get_cluster_centers,
-)
-from mcmc.utils.plot import plot_clustering_results
+
+try:
+    from mcmc.utils.clustering import (
+        find_closest_points_indices,
+        get_cluster_centers,
+    )
+    from mcmc.utils.plot import plot_clustering_results
+except ImportError:
+    find_closest_points_indices = None
+    get_cluster_centers = None
+    plot_clustering_results = None
 
 
 class MCMC:

@@ -1,7 +1,5 @@
 DEFAULT_CUTOFFS = {
-    "CHGNetNFF": 6.0,
-    "NffScaleMACE": 5.0,
-    "PaiNN": 5.0,
+    "MACE": 6.0,
 }
 
 DEFAULT_SAMPLING_SETTINGS = {

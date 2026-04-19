@@ -9,9 +9,6 @@ from ase import Atoms
 from ase.optimize import BFGS, FIRE
 from ase.optimize.bfgslinesearch import BFGSLineSearch
 from ase.optimize.sciopt import SciPyFminCG
-from nff.io.ase import AtomsBatch
-
-from mcmc.utils.misc import get_atoms_batch
 
 # Threshold for unrelaxed energy
 ENERGY_THRESHOLD = 1000  # eV
@@ -106,13 +103,6 @@ def optimize_slab(
 
     if "LAMMPS" in optimizer:
         calc_slab, energy, _ = slab.calc.run_lammps_opt(slab, run_dir=slab.calc.run_dir)
-
-        if isinstance(slab, AtomsBatch):
-            calc_slab = get_atoms_batch(
-                calc_slab,
-                nff_cutoff=slab.cutoff,
-                device=slab.device,
-            )
         traj = None
 
     else:
@@ -125,8 +115,7 @@ def optimize_slab(
             Optimizer = SciPyFminCG
         else:
             Optimizer = FIRE
-        if isinstance(slab, AtomsBatch):
-            slab.update_nbr_list(update_atoms=True)
+
         calc_slab = slab.copy()
         calc_slab.calc = slab.calc
 

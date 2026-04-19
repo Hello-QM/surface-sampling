@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH --job-name=cusn-al
+#SBATCH --partition=gpu-shared
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus=1
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+#SBATCH --account=sdp126
+#SBATCH --output=cusn_al.o%j.%N
+
+# Full active learning loop: sample → cluster → (DFT) → fine-tune → repeat
+# Usage:
+#   sbatch cusn_active_learning.sb                           # dry-run (no DFT)
+#   SKIP_DFT="" NUM_ITER=5 sbatch cusn_active_learning.sb   # with DFT, 5 iterations
+
+WORK_DIR=/expanse/projects/qstore/csd807/gliu3/containers
+SURFACE_DIR=${WORK_DIR}/surface-sampling
+CONTAINER=${WORK_DIR}/mace-lammps-v3.sif
+EXTRA_PKGS=${WORK_DIR}/extra-packages
+
+export SINGULARITYENV_PYTHONPATH="${EXTRA_PKGS}"
+
+cd ${SURFACE_DIR}
+
+singularity exec --nv --bind ${EXTRA_PKGS} ${CONTAINER} \
+    python scripts/active_learning_loop.py \
+    --data_folder data/CuSn_001/ \
+    --foundation_model "${FOUNDATION_MODEL:-/expanse/projects/qstore/csd807/gliu3/ML-potentials/MACE-matpes-pbe-omat-ft.model}" \
+    --settings_path scripts/configs/sample_cusn_pourbaix_config.json \
+    --num_iterations "${NUM_ITER:-3}" \
+    --structures_per_iter "${STRUCT_PER_ITER:-20}" \
+    --finetune_epochs "${FT_EPOCHS:-30}" \
+    --finetune_freeze "${FT_FREEZE:-f5}" \
+    ${SKIP_DFT:---skip_dft} \
+    --save_folder results/cusn_al/ \
+    --device cuda

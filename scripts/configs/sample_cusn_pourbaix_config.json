@@ -1,6 +1,6 @@
 {
     "system_settings": {
-        "surface_name": "LaMnO3_001_2x2x3_asymmetric_sampling",
+        "surface_name": "CuSn_001_2x2",
         "surface_depth": 3,
         "cutoff": 6.0,
         "near_reduce": 0.01,
@@ -10,26 +10,20 @@
         "sample_surface_atoms": true
     },
     "sampling_settings": {
-        "total_sweeps": 10,
-        "sweep_size": 20,
+        "total_sweeps": 20,
+        "sweep_size": 30,
         "start_temp": 0.257,
         "perform_annealing": false,
         "alpha": 1.0,
-        "adsorbates": [
-            "Mn",
-            "La",
-            "O",
-            "HO"
-        ],
-        "run_folder": "LaMnO3_001"
-
+        "adsorbates": ["Cu", "Sn", "O", "HO"],
+        "canonical": false
     },
     "calc_settings": {
         "calc_name": "Pourbaix",
         "optimizer": "FIRE",
         "chem_pots": {
-            "Mn": 0.0,
-            "La": 0.0,
+            "Cu": 0.0,
+            "Sn": 0.0,
             "O": 0.0
         },
         "adsorbate_corrections": {
@@ -41,7 +35,7 @@
         "offset": false,
         "offset_data": null,
         "temperature": 0.0257,
-        "pH": 12.0,
-        "phi": 1.0
+        "pH": 7.0,
+        "phi": 0.0
     }
 }

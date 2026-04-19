@@ -10,16 +10,14 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+import torch
 from default_settings import DEFAULT_CUTOFFS, DEFAULT_SAMPLING_SETTINGS
 from monty.serialization import dumpfn, loadfn
-from nff.train.builders.model import load_model
-from nff.utils.cuda import get_final_device
 
 from mcmc import MCMC
-from mcmc.calculators import EnsembleNFFSurface
+from mcmc.calculators import MACESurface
 from mcmc.system import SurfaceSystem
 from mcmc.utils import setup_logger
-from mcmc.utils.misc import get_atoms_batch
 from mcmc.utils.plot import plot_summary_stats
 from mcmc.utils.setup import setup_folders
 
@@ -42,18 +40,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to the starting structure",
     )
     parser.add_argument(
-        "--model_type",
-        type=str,
-        choices=["PaiNN", "NffScaleMACE", "CHGNetNFF"],
-        default="CHGNetNFF",
-        help="Type of NFF machine learning force field model to use",
-    )
-    parser.add_argument(
         "--model_paths",
         type=str,
         nargs="*",
         default=[""],
-        help="Space separated paths to NFF models",
+        help="Space separated paths to MACE model files",
     )
     parser.add_argument(
         "--settings_path",
@@ -80,7 +71,6 @@ def parse_args() -> argparse.Namespace:
 def main(
     run_name: str,
     starting_structure_path: Path | str,
-    model_type: Literal["PaiNN", "NffScaleMACE", "CHGNetNFF"],
     model_paths: list[str],
     settings_path: str = "settings.json",
     device: Literal["cpu", "cuda"] = "cuda",
@@ -91,8 +81,7 @@ def main(
     Args:
         run_name (str): name of the run
         starting_structure_path (Path | str): path to the starting structure
-        model_type (Literal["PaiNN", "NffScaleMACE", "CHGNetNFF"]): type of NFF model to use
-        model_paths (list[str]): paths to the models
+        model_paths (list[str]): paths to the MACE model files
         settings_path (str, optional): path to the settings file. Defaults to "settings.json"
         device (Literal["cpu", "cuda"], optional): device to use for calculations.
             Defaults to "cuda"
@@ -108,7 +97,7 @@ def main(
 
     # Update empty settings with default params
     system_settings["surface_name"] = system_settings.get("surface_name", run_name)
-    system_settings["cutoff"] = system_settings.get("cutoff", DEFAULT_CUTOFFS[model_type])
+    system_settings["cutoff"] = system_settings.get("cutoff", DEFAULT_CUTOFFS["MACE"])
     sampling_settings = DEFAULT_SAMPLING_SETTINGS | sampling_settings
 
     # Initialize run folder
@@ -159,37 +148,26 @@ def main(
         raise e
 
     # Initialize Calculator
-    device = get_final_device(device)
+    device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
 
-    models = []
-    for model_path in model_paths:
-        model = load_model(model_path, model_type=model_type, map_location=device)
-        models.append(model)
-    nff_surf_calc = EnsembleNFFSurface(
-        models,
+    mace_surf_calc = MACESurface(
+        model_paths,
         device=device,
-        model_units=models[0].units if model_type != "PaiNN" else "kcal/mol",
-        prediction_units="eV",
-        offset_units="eV" if model_type != "PaiNN" else "atomic",
+        enable_cueq=True,
+        offset_units=calc_settings.get("offset_units", "eV"),
     )
-    nff_surf_calc.set(**calc_settings)
+    mace_surf_calc.set(**calc_settings)
 
     # Initialize SurfaceSystem
-    slab_batch = get_atoms_batch(
-        starting_slab,
-        nff_cutoff=system_settings["cutoff"],
-        device=device,
-        props={"energy": 0, "energy_grad": []},  # needed for NFF
-    )
     surface = SurfaceSystem(
-        slab_batch,
-        calc=nff_surf_calc,
+        starting_slab,
+        calc=mace_surf_calc,
         system_settings=system_settings,
         save_folder=run_folder,
     )
     surface.all_atoms.write(run_folder / "all_virtual_ads.cif")
     logger.info("Starting surface energy: %.3f eV", float(surface.get_surface_energy()))
-    logger.info("Offset units: %s", nff_surf_calc.offset_units)
+    logger.info("Offset units: %s", mace_surf_calc.offset_units)
 
     # Perform MCMC
     mcmc = MCMC(**sampling_settings)
@@ -243,7 +221,6 @@ if __name__ == "__main__":
     main(
         args.run_name,
         args.starting_structure_path,
-        args.model_type,
         args.model_paths,
         args.settings_path,
         args.device,
