@@ -185,3 +185,54 @@ class SwitchProposal(Proposal):
             "site1_ads": site1_ads,
             "site2_ads": site2_ads,
         }
+
+
+class FixedActionChangeProposal(ChangeProposal):
+    """A ChangeProposal that returns a pre-specified, cached action.
+
+    Used by the Multiple-Try Metropolis path in
+    :class:`mcmc.hamiltonian_re.HamiltonianREMC`
+    (see :meth:`HamiltonianREMC._mc_step_mtm`). During the MTM step we
+    sample k candidate actions from ``ChangeProposal``, evaluate each via
+    the full forward → geometry_ok → FIRE relax → bonding_ok → MACE
+    energy pipeline, pick one by Boltzmann weight, then need to re-apply
+    the picked action after the state has been rolled back to x.
+
+    ``get_action`` returns the cached dict verbatim (no resampling), so
+    wrapping the picked action in this proposal lets us drive
+    :class:`mcmc.events.event.Change.forward` deterministically with the
+    same ``(site_idx, start_ads, end_ads)`` as during the trial phase.
+    """
+
+    def __init__(
+        self,
+        system: SurfaceSystem,
+        adsorbate_list: Iterable[str] = ("Sr", "O"),
+        fixed_action: dict | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        """Initialize.
+
+        Args:
+            system: The surface system to propose changes to.
+            adsorbate_list: The list of adsorbates that can be proposed.
+            fixed_action: A dict of the form returned by
+                ``ChangeProposal.get_action``, i.e. with keys
+                ``name``, ``site_idx``, ``start_ads``, ``end_ads``.
+                If ``None``, behaves identically to ``ChangeProposal``.
+            logger: Optional logger.
+        """
+        super().__init__(
+            system=system,
+            adsorbate_list=adsorbate_list,
+            site_idx=fixed_action["site_idx"] if fixed_action else None,
+            logger=logger,
+        )
+        self._fixed_action = dict(fixed_action) if fixed_action is not None else None
+
+    def get_action(self) -> dict[str, Any]:
+        """Return the cached action verbatim, or fall back to random sampling."""
+        if self._fixed_action is None:
+            return super().get_action()
+        # Return a fresh dict each call so callers can't mutate our cache.
+        return dict(self._fixed_action)
