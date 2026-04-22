@@ -154,13 +154,63 @@ def _ase_to_mda(atoms: ase.Atoms):
     return u
 
 
+def count_hbonds_ase(
+    atoms: ase.Atoms,
+    d_a_cutoff: float = 3.0,
+    d_h_a_angle_cutoff: float = 120.0,
+    d_h_cutoff: float = 1.2,
+) -> int:
+    """Pure-ASE/numpy fallback implementing the same Luzar-Chandler criterion
+    as ``count_hbonds``, without MDAnalysis. Used when MDAnalysis isn't
+    available in the env (e.g. Expanse my_pymatgen).
+
+    Algorithm:
+      - For each H atom, find its donor O (nearest O within d_h_cutoff).
+        If no donor O → not a valid H-bond donor.
+      - For each donor-H, find acceptor Os within d_a_cutoff (excluding donor).
+      - For each candidate acceptor, compute O-H...O angle; if ≥ angle cutoff,
+        count as one H-bond.
+    """
+    syms = atoms.get_chemical_symbols()
+    O_idx = [i for i, s in enumerate(syms) if s == "O"]
+    H_idx = [i for i, s in enumerate(syms) if s == "H"]
+    if not H_idx or len(O_idx) < 2:
+        return 0
+
+    n_hb = 0
+    for h in H_idx:
+        # Donor O: nearest O within covalent cutoff
+        d_oh = atoms.get_distances(h, O_idx, mic=True)
+        close = [(d_oh[k], O_idx[k]) for k in range(len(O_idx)) if d_oh[k] < d_h_cutoff]
+        if not close:
+            continue
+        _, donor = min(close)
+        # Candidate acceptors: O atoms within d_a_cutoff of donor, excluding donor
+        others = [o for o in O_idx if o != donor]
+        if not others:
+            continue
+        d_don_other = atoms.get_distances(donor, others, mic=True)
+        for k, acceptor in enumerate(others):
+            if d_don_other[k] > d_a_cutoff:
+                continue
+            # Angle donor-H...acceptor (mic-aware via get_angle)
+            try:
+                angle = atoms.get_angle(donor, h, acceptor, mic=True)
+            except Exception:
+                continue
+            if angle >= d_h_a_angle_cutoff:
+                n_hb += 1
+    return n_hb
+
+
 def count_hbonds(
     atoms: ase.Atoms,
     d_a_cutoff: float = 3.0,
     d_h_a_angle_cutoff: float = 120.0,
     d_h_cutoff: float = 1.2,
 ) -> int:
-    """Count hydrogen bonds using MDAnalysis HydrogenBondAnalysis.
+    """Count hydrogen bonds using MDAnalysis HydrogenBondAnalysis if available,
+    else fall back to ``count_hbonds_ase`` (pure ASE/numpy equivalent).
 
     Implements the standard Luzar-Chandler / Baker-Hubbard criterion:
     donor O covalently bonded to H (``d_O-H < d_h_cutoff``), acceptor O
@@ -176,7 +226,15 @@ def count_hbonds(
     Returns:
         Number of H-bonds in the structure.
     """
-    from MDAnalysis.analysis.hydrogenbonds import HydrogenBondAnalysis as HBA
+    try:
+        from MDAnalysis.analysis.hydrogenbonds import HydrogenBondAnalysis as HBA
+    except ImportError:
+        return count_hbonds_ase(
+            atoms,
+            d_a_cutoff=d_a_cutoff,
+            d_h_a_angle_cutoff=d_h_a_angle_cutoff,
+            d_h_cutoff=d_h_cutoff,
+        )
 
     u = _ase_to_mda(atoms)
     hba = HBA(
