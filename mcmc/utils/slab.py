@@ -5,7 +5,6 @@ from collections.abc import Iterable
 import ase
 import numpy as np
 from ase.build.tools import sort
-from catkit.gen.surface import SlabGenerator
 from pymatgen.core.structure import Structure
 from pymatgen.core.surface import SlabGenerator as PMGSlabGenerator
 from pymatgen.io.vasp.inputs import Poscar
@@ -38,6 +37,8 @@ def surface_from_bulk(
     """
     # bulk.set_initial_magnetic_moments(bulk.get_initial_magnetic_moments())
     # layers = 5
+    from catkit.gen.surface import SlabGenerator  # lazy import (heavy, optional dep)
+
     gen = SlabGenerator(
         bulk,
         miller_index=miller_index,
