@@ -399,14 +399,29 @@ class MACEPourbaix(Calculator):
         self.pH = kwargs.get("pH", 7)  # pH
         self.pourbaix_atoms = {}
         self.offset_data = kwargs.get("offset_data", {})
+        # LEGACY: per-adsorbate single-value correction dict (e.g. {"HO": 0.23}).
+        # Kept for backward compatibility / comparison; only used when
+        # use_adsorbate_gibbs is explicitly set to False. New workflows
+        # should leave use_adsorbate_gibbs at the default (True) and configure
+        # slab_correction_kwargs instead.
         self.adsorbate_corrections = {}
-        # 3-layer slab_correction (opt-in). When True, get_delta_G1 calls
+        # AUTHORITATIVE PATH — 3-layer slab_correction (default = True).
+        # When True, get_delta_G1 calls
         # mcmc.corrections.adsorbate_gibbs.slab_correction(atoms, **kwargs)
-        # to add a per-oxide Δ_O + per-species adsorbate Gibbs + MDAnalysis
-        # H-bond correction, replacing the legacy single-value
-        # self.adsorbate_corrections dict (e.g. {"HO": 0.23}).
-        # See mcmc/corrections/adsorbate_gibbs.py for the 3-layer scheme.
-        self.use_adsorbate_gibbs = False
+        # to add:
+        #   Layer A — per-oxide Δ_O (fit to experimental ΔG°_f; default
+        #             -0.1252 eV/O for IrO₂, configurable via
+        #             slab_correction_kwargs["delta_O"]).
+        #   Layer B — per-species adsorbate Gibbs (ZPE + ∫Cp dT − TS) for
+        #             *O/*OH/*OOH/*H₂O/*H, with geometric identification by
+        #             Ir-coordination (metal_symbol configurable).
+        #   Layer C — hydrogen-bond count × ε_HB (Luzar-Chandler criterion
+        #             via MDAnalysis).
+        # Replaces both the legacy MP2020 oxide_correction_per_O (Layer A)
+        # and the self.adsorbate_corrections dict (Layer B). See
+        # mcmc/corrections/adsorbate_gibbs.py for the scheme and
+        # learning_notes.md §19 for the thermodynamic derivation.
+        self.use_adsorbate_gibbs = True
         self.slab_correction_kwargs = {}
         self.logger = kwargs.get("logger", logging.getLogger(__name__))
 
@@ -635,7 +650,17 @@ class MACEPourbaix(Calculator):
             )
         if "use_adsorbate_gibbs" in self.parameters:
             self.use_adsorbate_gibbs = bool(self.parameters["use_adsorbate_gibbs"])
-            self.logger.info("use_adsorbate_gibbs = %s", self.use_adsorbate_gibbs)
+            if self.use_adsorbate_gibbs:
+                self.logger.info(
+                    "ΔG_pbx path: 3-layer slab_correction (authoritative)"
+                )
+            else:
+                self.logger.warning(
+                    "ΔG_pbx path: LEGACY adsorbate_corrections dict + MP2020 "
+                    "oxide_correction_per_O. The 3-layer scheme "
+                    "(use_adsorbate_gibbs=True, default) is authoritative; "
+                    "use legacy only for comparison / reproducing old results."
+                )
         if "slab_correction_kwargs" in self.parameters:
             self.slab_correction_kwargs = self.parameters["slab_correction_kwargs"]
             self.logger.info(
