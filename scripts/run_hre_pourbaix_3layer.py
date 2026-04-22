@@ -181,12 +181,33 @@ def main():
     from mcmc.utils import setup_logger
 
     logger = setup_logger("hre_3layer", run_folder / "hre.log", level=logging.INFO)
-    logger.info("feat/batched-ntrial — 3-layer ΔG_pbx + MTM (k=%d)", args.n_trials)
+    logger.info("=" * 72)
+    logger.info("feat/batched-ntrial — experimental-first ΔG_pbx + MTM")
+    logger.info("=" * 72)
     logger.info("Replica grid: pH=%s φ=%s", args.pH, args.phi)
-    logger.info("Sampling: %d sweeps × %d moves, save every %d sweeps, swap every %d",
-                args.total_sweeps, args.sweep_size, args.save_interval, args.swap_interval)
-    logger.info("3-layer: Δ_O=%.4f eV/O, metal=%s, ε_HB=%.3f eV",
-                args.delta_O, args.metal, args.eps_hbond)
+    logger.info("Sampling: %d sweeps × %d moves, save every %d, swap every %d, MTM k=%d",
+                args.total_sweeps, args.sweep_size, args.save_interval,
+                args.swap_interval, args.n_trials)
+    logger.info("")
+    logger.info("ΔG₁ side (MACEPourbaix, use_adsorbate_gibbs=True):")
+    logger.info("  Layer A (bulk oxide): Δ_O = %+.4f eV/O applied to ALL O atoms", args.delta_O)
+    from mcmc.corrections.adsorbate_gibbs import ADS_G_INTRINSIC
+    logger.info("  Layer B (per-species adsorbate ZPE + ∫Cp dT − TS @ 298 K, ALL species):")
+    for sp in ("O", "OH", "OOH", "H2O", "H"):
+        if sp in ADS_G_INTRINSIC:
+            logger.info("      *%-4s  G_intrinsic = %+.4f eV", sp, ADS_G_INTRINSIC[sp])
+    logger.info("  Layer C (H-bonds): ε_HB = %+.3f eV × n_hbonds (Luzar-Chandler geometry)",
+                args.eps_hbond)
+    logger.info("")
+    logger.info("ΔG₂ side: apply_experimental_solid_overrides(%s)",
+                ", ".join(args.experimental_override))
+    logger.info("  → MP solid entries are shifted to experimental ΔG°_f.")
+    logger.info("  → MP ion entries already come from NIST / Pourbaix Atlas (experimental).")
+    logger.info("")
+    logger.info("Legacy paths INACTIVE: adsorbate_corrections={HO:0.23} dict is skipped")
+    logger.info("by use_adsorbate_gibbs=True in calculators.py; MP2020's -0.687 eV/O")
+    logger.info("oxide_correction_per_O is skipped by the same flag.")
+    logger.info("=" * 72)
 
     # Experimental ΔG°_f override on the Pourbaix JSON (REQUIRED; argparse
     # enforces at least one value — see required=True on the arg).
