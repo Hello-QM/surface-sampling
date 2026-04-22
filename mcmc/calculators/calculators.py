@@ -400,6 +400,14 @@ class MACEPourbaix(Calculator):
         self.pourbaix_atoms = {}
         self.offset_data = kwargs.get("offset_data", {})
         self.adsorbate_corrections = {}
+        # 3-layer slab_correction (opt-in). When True, get_delta_G1 calls
+        # mcmc.corrections.adsorbate_gibbs.slab_correction(atoms, **kwargs)
+        # to add a per-oxide Δ_O + per-species adsorbate Gibbs + MDAnalysis
+        # H-bond correction, replacing the legacy single-value
+        # self.adsorbate_corrections dict (e.g. {"HO": 0.23}).
+        # See mcmc/corrections/adsorbate_gibbs.py for the 3-layer scheme.
+        self.use_adsorbate_gibbs = False
+        self.slab_correction_kwargs = {}
         self.logger = kwargs.get("logger", logging.getLogger(__name__))
 
     def get_delta_G2_individual(self, atom: str | PourbaixAtom) -> float:
@@ -476,6 +484,19 @@ class MACEPourbaix(Calculator):
 
         slab_energy = self.get_potential_energy(atoms=atoms)
 
+        # 3-layer slab correction (opt-in). Added to slab_energy so the
+        # downstream ΔG₁ formula absorbs it consistently:
+        #   non-offset:  ΔG₁ = Σ μ° − (E_NFF + G_corr)
+        #   offset:      ΔG₁ = (E_NFF + G_corr) − E_bulk_ref
+        # Replaces both the legacy MP2020 oxide_correction_per_O (Layer A) and
+        # the self.adsorbate_corrections dict loop (Layer B). See
+        # mcmc/corrections/adsorbate_gibbs.py for the experimental-first
+        # per-oxide Δ_O + per-species ZPE-TS + MDAnalysis H-bond count.
+        if self.use_adsorbate_gibbs:
+            from mcmc.corrections.adsorbate_gibbs import slab_correction
+            G_corr = slab_correction(atoms, **self.slab_correction_kwargs)
+            slab_energy = slab_energy + G_corr
+
         if self.offset_data:
             # Use MACE-consistent bulk references (same energy scale as slab)
             ads_count = Counter(atoms.get_chemical_symbols())
@@ -490,10 +511,14 @@ class MACEPourbaix(Calculator):
             # oxide correction here brings delta_G1 onto the same scale.
             # The bulk_energies in offset_data should already include the
             # correction for compounds (IrO2, H2O) but not for elemental refs.
-            oxide_corr = self.offset_data.get("oxide_correction_per_O", 0.0)
-            if oxide_corr != 0.0:
-                n_O_slab = ads_count.get("O", 0)
-                slab_energy += oxide_corr * n_O_slab
+            # Skipped when use_adsorbate_gibbs is True — Layer A of the 3-layer
+            # scheme already applies a per-oxide Δ_O (fit to experimental
+            # ΔG°_f) which supersedes MP2020's generic -0.687 eV/O.
+            if not self.use_adsorbate_gibbs:
+                oxide_corr = self.offset_data.get("oxide_correction_per_O", 0.0)
+                if oxide_corr != 0.0:
+                    n_O_slab = ads_count.get("O", 0)
+                    slab_energy += oxide_corr * n_O_slab
 
             bulk_ref_en = ads_count[ref_element] * bulk_energies[ref_formula]
             for ele in ads_count:
@@ -516,8 +541,15 @@ class MACEPourbaix(Calculator):
         # Note: corrections are only applied if the adsorbate species is actually
         # present in the slab formula. If not, divmod returns 0 and no correction
         # is added.
+        # Skipped when use_adsorbate_gibbs is True — Layer B of the 3-layer
+        # scheme already applies per-species ZPE-TS (for *O, *OH, *OOH, *H₂O,
+        # *H) via geometric adsorbate identification, and Layer C counts
+        # hydrogen bonds via MDAnalysis. These supersede the divmod-by-formula
+        # scheme here (which only knew about OH).
         formula = Formula(atoms.get_chemical_formula())
-        for adsorbate, correction in self.adsorbate_corrections.items():
+        for adsorbate, correction in (
+            {} if self.use_adsorbate_gibbs else self.adsorbate_corrections
+        ).items():
             # Check for H2O
             if "O" in adsorbate and "H" in adsorbate:
                 # Assume the extra H is from water so subtract H2O from the formula
@@ -600,6 +632,14 @@ class MACEPourbaix(Calculator):
             self.adsorbate_corrections = self.parameters["adsorbate_corrections"]
             self.logger.info(
                 "adsorbate corrections: %s are set from parameters", self.adsorbate_corrections
+            )
+        if "use_adsorbate_gibbs" in self.parameters:
+            self.use_adsorbate_gibbs = bool(self.parameters["use_adsorbate_gibbs"])
+            self.logger.info("use_adsorbate_gibbs = %s", self.use_adsorbate_gibbs)
+        if "slab_correction_kwargs" in self.parameters:
+            self.slab_correction_kwargs = self.parameters["slab_correction_kwargs"]
+            self.logger.info(
+                "slab_correction_kwargs: %s", self.slab_correction_kwargs
             )
         return changed_params
 
