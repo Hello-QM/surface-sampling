@@ -247,6 +247,7 @@ class HamiltonianREMC:
         swap_interval: int = 1,
         n_trials: int = 1,
         uncertainty_tracker: UncertaintyTracker | None = None,
+        pourbaix_source: str = "mp",
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -274,13 +275,35 @@ class HamiltonianREMC:
         self.replica_pourbaix_atoms: list[dict[str, PourbaixAtom]] = []
         self._pbx_cache: dict[tuple[float, float], dict[str, PourbaixAtom]] = {}
 
+        # Pick the Pourbaix-atoms generator based on pourbaix_source. The
+        # default "bratsch" path uses the user's pure-experimental species
+        # list (Bratsch 1989 + Cordfunke 1981) and skips MP / MP2020 /
+        # Pourbaix-Atlas data entirely. "mp" falls back to the legacy
+        # generate_pourbaix_atoms path which needs a patched MP JSON.
+        if pourbaix_source == "bratsch":
+            from mcmc.pourbaix.atoms_bratsch import generate_pourbaix_atoms_bratsch
+
+            def _gen(pH, phi):
+                return generate_pourbaix_atoms_bratsch(
+                    phi=phi, pH=pH, elements=elements,
+                )
+        elif pourbaix_source == "mp":
+            def _gen(pH, phi):
+                return generate_pourbaix_atoms(
+                    phase_diagram_path, pourbaix_diagram_path,
+                    phi=phi, pH=pH, elements=elements,
+                )
+        else:
+            raise ValueError(
+                f"Unknown pourbaix_source={pourbaix_source!r}; expected "
+                "'bratsch' (default, pure experimental) or 'mp' (legacy)."
+            )
+        self.logger.info("Pourbaix-atoms source: %s", pourbaix_source)
+
         for cond in conditions:
             key = (cond.pH, cond.phi)
             if key not in self._pbx_cache:
-                pa = generate_pourbaix_atoms(
-                    phase_diagram_path, pourbaix_diagram_path,
-                    phi=cond.phi, pH=cond.pH, elements=elements,
-                )
+                pa = _gen(cond.pH, cond.phi)
                 self._pbx_cache[key] = pa
                 self.logger.info("  %s: %s", cond, {k: v.dominant_species for k, v in pa.items()})
             self.replica_pourbaix_atoms.append(self._pbx_cache[key])

@@ -160,18 +160,27 @@ def main():
     ap.add_argument("--eps_hbond", type=float, default=-0.15,
                     help="Layer C H-bond correction in eV/H-bond")
 
-    # Experimental ΔG°_f overrides (ΔG₂ side) — REQUIRED for the authoritative
-    # experimental-first pipeline. We do not allow MC to run without the
-    # overrides: ΔG₂ on stock MP data uses DFT+MP2020 for solids (inconsistent
-    # with the 3-layer per-oxide Δ_O on the ΔG₁ side and with the MP ion
-    # entries themselves, which ARE experimental). Set to e.g.
-    # "IrO2:+1.76" so the IrO₂(s) solid energy shifts to Bratsch /
-    # Cordfunke −2.017 eV/fu.
-    ap.add_argument("--experimental_override", nargs="+", required=True,
-                    help='REQUIRED per-fu shifts applied to Pourbaix JSON solids, '
+    # Pourbaix-atoms source: controls how the ΔG₂ per-element partials are
+    # constructed for each (pH, φ) point during MC.
+    #   bratsch (default)  → pure experimental (Bratsch 1989 + Cordfunke 1981)
+    #                        No IrO₄²⁻(aq) because Bratsch has no verified
+    #                        value; IrO₃(s) covers high-φ. No MP / MP2020.
+    #   mp                  → MP pourbaix_atoms via generate_pourbaix_atoms
+    #                        (requires --experimental_override to shift MP
+    #                        solids to experimental values). Legacy path;
+    #                        use only to reproduce old runs.
+    ap.add_argument("--pourbaix_source", choices=["bratsch", "mp"], default="bratsch",
+                    help="Source of ΔG₂ standard-state energies. 'bratsch' "
+                         "(default) uses the pure-experimental species list "
+                         "from bulk_pourbaix_exp.ir_species_experimental. "
+                         "'mp' uses MP pbx JSON + --experimental_override.")
+    # Only required when --pourbaix_source=mp (legacy); optional on bratsch.
+    ap.add_argument("--experimental_override", nargs="+", default=None,
+                    help='Per-fu shifts applied to Pourbaix JSON solids, '
                          'e.g. --experimental_override IrO2:+1.76. '
-                         "Requires fork_port (xiaochendu pymatgen fork). "
-                         "No implicit fallback to MP DFT+MP2020 solids.")
+                         "REQUIRED if --pourbaix_source mp; ignored on bratsch "
+                         "(Bratsch uses experimental ΔG°_f directly without "
+                         "needing MP JSON shifting).")
 
     # Files
     ap.add_argument("--model", required=True, help="MACE model .model path")
@@ -221,26 +230,44 @@ def main():
     logger.info("  Layer C (H-bonds): ε_HB = %+.3f eV × n_hbonds (Luzar-Chandler geometry)",
                 args.eps_hbond)
     logger.info("")
-    logger.info("ΔG₂ side: apply_experimental_solid_overrides(%s)",
-                ", ".join(args.experimental_override))
-    logger.info("  → MP solid entries are shifted to experimental ΔG°_f.")
-    logger.info("  → MP ion entries already come from NIST / Pourbaix Atlas (experimental).")
+    if args.pourbaix_source == "bratsch":
+        logger.info("ΔG₂ side: pure Bratsch 1989 + Cordfunke 1981 experimental data")
+        logger.info("  → No MP JSON; no MP2020; no Pourbaix-Atlas IrO₄²⁻ estimate.")
+        logger.info("  → Ir species: {Ir(s), IrO₂(s), Ir³⁺(aq), IrO₃(s)} — IrO₃ at high φ")
+    else:
+        if not args.experimental_override:
+            sys.stderr.write(
+                "\nFATAL: --pourbaix_source mp requires --experimental_override "
+                "(e.g. --experimental_override IrO2:+1.76). Otherwise ΔG₂ uses "
+                "legacy MP DFT+MP2020 for solids. Use --pourbaix_source bratsch "
+                "(default) to bypass MP entirely.\n"
+            )
+            sys.exit(1)
+        logger.info("ΔG₂ side: LEGACY MP JSON + apply_experimental_solid_overrides(%s)",
+                    ", ".join(args.experimental_override))
+        logger.info("  → MP solid entries are shifted to experimental ΔG°_f.")
+        logger.info("  → MP ion entries include Pourbaix-Atlas-estimated IrO₄²⁻.")
     logger.info("")
     logger.info("Legacy paths INACTIVE: adsorbate_corrections={HO:0.23} dict is skipped")
     logger.info("by use_adsorbate_gibbs=True in calculators.py; MP2020's -0.687 eV/O")
     logger.info("oxide_correction_per_O is skipped by the same flag.")
     logger.info("=" * 72)
 
-    # Experimental ΔG°_f override on the Pourbaix JSON (REQUIRED; argparse
-    # enforces at least one value — see required=True on the arg).
-    overrides = {}
-    for s in args.experimental_override:
-        k, v = s.split(":")
-        overrides[k] = float(v)
-    pbx_path = patch_pbx_with_experimental_overrides(
-        Path(args.pourbaix_diagram), overrides, run_folder,
-    )
-    logger.info("Using patched Pourbaix JSON (experimental ΔG°_f): %s", pbx_path)
+    # Build the Pourbaix-diagram path for HamiltonianREMC. Only used by the
+    # MP (legacy) path; bratsch path will override pourbaix_atoms on each
+    # replica's MACEPourbaix via calc.set(pourbaix_atoms=...) and will not
+    # rely on the diagram for ΔG₂.
+    if args.pourbaix_source == "mp":
+        overrides = {}
+        for s in args.experimental_override:
+            k, v = s.split(":")
+            overrides[k] = float(v)
+        pbx_path = patch_pbx_with_experimental_overrides(
+            Path(args.pourbaix_diagram), overrides, run_folder,
+        )
+        logger.info("Using patched Pourbaix JSON (experimental ΔG°_f): %s", pbx_path)
+    else:
+        pbx_path = args.pourbaix_diagram  # loaded but overridden post-init
 
     # Load slab + sites
     with open(args.slab_pkl, "rb") as f:
@@ -290,6 +317,7 @@ def main():
         swap_interval=args.swap_interval,
         n_trials=args.n_trials,
         uncertainty_tracker=uncertainty,
+        pourbaix_source=args.pourbaix_source,
         logger=logger,
     )
 
