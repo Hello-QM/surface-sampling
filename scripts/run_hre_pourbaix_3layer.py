@@ -137,6 +137,22 @@ def main():
                          "per AL round, regardless of total_sweeps. Default "
                          "None = run all total_sweeps.")
 
+    # GMM-based uncertainty (single-MACE-model OOD detection) for smart AL.
+    ap.add_argument("--gmm_training_xyz", default=None,
+                    help="Path to an ASE-readable file (extxyz / traj / dir of "
+                         "CIFs) containing the DFT training structures. If set, "
+                         "a GaussianMixture is fit on their MACE embeddings at "
+                         "startup, and MC is stopped early when newly-saved "
+                         "snapshots' log-likelihood distribution has saturated "
+                         "(no new OOD structures being found). Requires sklearn.")
+    ap.add_argument("--gmm_n_components", type=int, default=16)
+    ap.add_argument("--gmm_logl_threshold", type=float, default=None,
+                    help="OOD cutoff on GMM log-L (below = OOD). If omitted, "
+                         "auto-set to the 5%%-quantile of the training log-L.")
+    ap.add_argument("--gmm_saturation_window", type=int, default=3)
+    ap.add_argument("--gmm_saturation_tolerance", type=float, default=0.1)
+    ap.add_argument("--gmm_min_saves_before_check", type=int, default=6)
+
     # 3-layer correction
     ap.add_argument("--delta_O", type=float, default=-0.1252,
                     help="Layer A per-O oxide correction in eV (default IrO2-fit)")
@@ -278,12 +294,36 @@ def main():
     )
 
     t0 = perf_counter()
+    # Build GMM tracker if the user supplied a training set. Fit happens
+    # once here before the MC run; each save during the run feeds snapshots
+    # in via add_snapshot() and may trigger early stop on saturation.
+    gmm_tracker = None
+    if args.gmm_training_xyz:
+        from ase.io import read as ase_read
+        from mcmc.uncertainty.gmm_tracker import GMMUncertaintyTracker
+        training_atoms = ase_read(args.gmm_training_xyz, index=":")
+        if not isinstance(training_atoms, list):
+            training_atoms = [training_atoms]
+        logger.info("GMM tracker: loaded %d training structures from %s",
+                    len(training_atoms), args.gmm_training_xyz)
+        gmm_tracker = GMMUncertaintyTracker(
+            calc=calc,
+            training_atoms=training_atoms,
+            n_components=args.gmm_n_components,
+            logl_threshold=args.gmm_logl_threshold,
+            saturation_window=args.gmm_saturation_window,
+            saturation_tolerance=args.gmm_saturation_tolerance,
+            min_saves_before_check=args.gmm_min_saves_before_check,
+            logger=logger,
+        )
+
     results = hre.run(
         surface=surface,
         total_sweeps=args.total_sweeps,
         sweep_size=args.sweep_size,
         save_interval=args.save_interval,
         max_snapshots_per_replica=args.max_snapshots_per_replica,
+        gmm_tracker=gmm_tracker,
         run_folder=str(run_folder),
         logger=logger,
     )
@@ -302,10 +342,28 @@ def main():
         )
 
     # Write a summary marker so /loop monitoring can see completion
-    (run_folder / "DONE").write_text(
+    done_text = (
         f"elapsed_s={elapsed:.1f}\nn_replicas={len(hre.conditions)}\n"
         f"n_diagram_points={len(diagram)}\n"
     )
+    if gmm_tracker is not None:
+        s = gmm_tracker.summary()
+        done_text += (
+            f"gmm_n_snapshots={s['n_snapshots']}\n"
+            f"gmm_n_ood={s['n_ood']}\n"
+            f"gmm_logl_threshold={s['logl_threshold']:.4f}\n"
+            f"gmm_logl_min={s.get('logl_min', float('nan')):.4f}\n"
+            f"gmm_ood_queue_size={s['ood_queue_size']}\n"
+        )
+        # Save OOD candidate list (CIFs) for downstream AL relabeling
+        from ase.io import write as ase_write
+        ood_dir = run_folder / "ood_candidates"
+        ood_dir.mkdir(exist_ok=True)
+        for i, atoms in enumerate(gmm_tracker.ood_queue):
+            ase_write(ood_dir / f"ood_{i:03d}.cif", atoms)
+        logger.info("GMM tracker: wrote %d OOD candidates to %s",
+                    len(gmm_tracker.ood_queue), ood_dir)
+    (run_folder / "DONE").write_text(done_text)
 
 
 if __name__ == "__main__":

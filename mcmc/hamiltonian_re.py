@@ -822,6 +822,7 @@ class HamiltonianREMC:
         sweep_size: int = 20,
         save_interval: int = 5,
         max_snapshots_per_replica: int | None = None,
+        gmm_tracker: "object | None" = None,
         run_folder: str | Path | None = None,
         logger: logging.Logger | None = None,
         **kwargs,
@@ -914,6 +915,31 @@ class HamiltonianREMC:
                     self.replicas[i].save_structures(
                         sweep_num=sweep_num + 1, save_folder=replica_folders[i],
                     )
+                # Feed each replica's current (relaxed) geometry to the GMM
+                # tracker. Log-L below threshold queues it as an OOD / AL
+                # candidate; the tracker also aggregates the history for
+                # the saturation test below.
+                if gmm_tracker is not None:
+                    for i in range(self.n_replicas):
+                        rep = self.replicas[i]
+                        atoms = getattr(rep, "relaxed_atoms", None) or rep.real_atoms
+                        try:
+                            gmm_tracker.add_snapshot(atoms)
+                        except Exception as exc:
+                            self.logger.warning(
+                                "[GMM] add_snapshot failed for replica %d: %s",
+                                i, exc,
+                            )
+                    if gmm_tracker.is_saturated():
+                        self.logger.info(
+                            "Early stop at sweep %d/%d — GMM log-L saturated. "
+                            "%d OOD structures queued for AL relabel. "
+                            "Skipping remaining %d sweeps.",
+                            sweep_num + 1, total_sweeps,
+                            len(gmm_tracker.ood_queue),
+                            total_sweeps - sweep_num - 1,
+                        )
+                        break
                 # AL-aware early stop: stop the whole run as soon as every
                 # replica has accumulated >= max_snapshots_per_replica saved
                 # snapshots. This lets the user fix an AL-round budget
