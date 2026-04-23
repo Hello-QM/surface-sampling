@@ -821,6 +821,7 @@ class HamiltonianREMC:
         total_sweeps: int = 100,
         sweep_size: int = 20,
         save_interval: int = 5,
+        max_snapshots_per_replica: int | None = None,
         run_folder: str | Path | None = None,
         logger: logging.Logger | None = None,
         **kwargs,
@@ -830,6 +831,13 @@ class HamiltonianREMC:
         Args:
             surface: Initial SurfaceSystem (copied for each replica).
             total_sweeps: Number of MC sweeps per replica.
+            max_snapshots_per_replica: Early-stop target. If set, the sweep
+                loop terminates as soon as every replica has saved at least
+                this many snapshots. Intended for active-learning rounds
+                where a fixed diversity budget (e.g. 5 snapshots / replica
+                × 9 replicas = 45 candidates → cluster to 25 for DFT) is
+                more useful than running out the full sweep count. Default
+                None = no early stop (original behavior).
             sweep_size: Steps per sweep.
             save_interval: Save structure snapshots every N sweeps (default 5).
                 Publication-quality sampling typically wants 5 (20 snapshots
@@ -906,6 +914,27 @@ class HamiltonianREMC:
                     self.replicas[i].save_structures(
                         sweep_num=sweep_num + 1, save_folder=replica_folders[i],
                     )
+                # AL-aware early stop: stop the whole run as soon as every
+                # replica has accumulated >= max_snapshots_per_replica saved
+                # snapshots. This lets the user fix an AL-round budget
+                # (e.g. "45 candidates per round") instead of running out
+                # total_sweeps unconditionally.
+                if max_snapshots_per_replica is not None:
+                    per_replica_saved = [
+                        len(list(Path(replica_folders[i]).glob("inb_relaxed_slab_sweep_*.cif")))
+                        for i in range(self.n_replicas)
+                    ]
+                    if all(n >= max_snapshots_per_replica for n in per_replica_saved):
+                        self.logger.info(
+                            "Early stop at sweep %d/%d — every replica has "
+                            "saved ≥ %d snapshots (per-replica counts: %s). "
+                            "Skipping remaining %d sweeps.",
+                            sweep_num + 1, total_sweeps,
+                            max_snapshots_per_replica,
+                            per_replica_saved,
+                            total_sweeps - sweep_num - 1,
+                        )
+                        break
 
         # Record final swap stats
         results["swap_stats"] = {

@@ -130,6 +130,12 @@ def main():
     ap.add_argument("--swap_interval", type=int, default=5)
     ap.add_argument("--n_trials", type=int, default=4,
                     help="MTM candidate count (1 = single-try Metropolis)")
+    ap.add_argument("--max_snapshots_per_replica", type=int, default=None,
+                    help="AL-aware early stop: break the sweep loop as soon "
+                         "as every replica has saved this many snapshots. "
+                         "Example: 5 → 9 replicas × 5 snapshots = 45 candidates "
+                         "per AL round, regardless of total_sweeps. Default "
+                         "None = run all total_sweeps.")
 
     # 3-layer correction
     ap.add_argument("--delta_O", type=float, default=-0.1252,
@@ -277,6 +283,7 @@ def main():
         total_sweeps=args.total_sweeps,
         sweep_size=args.sweep_size,
         save_interval=args.save_interval,
+        max_snapshots_per_replica=args.max_snapshots_per_replica,
         run_folder=str(run_folder),
         logger=logger,
     )
